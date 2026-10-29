@@ -585,10 +585,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return LRESULT(0);
             }
             if st.mode == Mode::Region && st.dragging {
-                let _ = ReleaseCapture();
+                // Read the selection and end the drag BEFORE releasing capture:
+                // ReleaseCapture synchronously sends WM_CAPTURECHANGED, which would
+                // otherwise treat this as a lost drag and throw the selection away.
                 let sel = st.selection().map(|s| st.clamp(s));
                 let old = st.decor_bounds(st.selection());
                 st.dragging = false;
+                let _ = ReleaseCapture();
                 match sel {
                     Some(s) if rect_w(&s) >= 4 && rect_h(&s) >= 4 => finish(hwnd, s),
                     _ => invalidate(hwnd, old),
