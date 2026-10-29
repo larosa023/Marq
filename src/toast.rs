@@ -4,6 +4,7 @@ use std::cell::Cell;
 
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::gfx::{argb, Graphics};
@@ -12,15 +13,17 @@ use crate::util::*;
 const CLASS: &str = "MarqToast";
 const TIMER_CLOSE: usize = 1;
 const SHOW_MS: u32 = 5000;
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 thread_local! {
     static CURRENT: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
 }
 
 struct Toast {
-    img: Image,
-    src: Dib,
-    thumb: RECT,
+    img: Option<Image>, // handed to the editor on click
+    thumb: Dib,         // pre-scaled once, so painting is a plain blit
+    thumb_at: (i32, i32),
+    back: Option<Dib>,
     dpi: u32,
     font_b: HFONT,
     font: HFONT,
@@ -40,13 +43,16 @@ pub fn register() {
     register_class(&WStr::new(CLASS), Some(wndproc), IDC_HAND, CS_DROPSHADOW);
 }
 
-pub fn close_current() {
+/// Close the card if one is showing. Returns true if there was one.
+pub fn close_current() -> bool {
     let h = CURRENT.with(|c| c.get());
     if !h.0.is_null() {
         unsafe {
             let _ = DestroyWindow(h);
         }
+        return true;
     }
+    false
 }
 
 /// Show the card near the bottom-right of the monitor where the snip was taken.
@@ -68,13 +74,24 @@ pub fn show(img: Image, near: RECT) {
     let h = th + pad * 2 + text_h;
     let x = work.right - w - sc(16, dpi);
     let y = work.bottom - h - sc(16, dpi);
-    let thumb = rect((w - tw) / 2, pad, (w - tw) / 2 + tw, pad + th);
 
-    let Some(src) = Dib::from_image(&img) else { return };
+    // Scale the thumbnail once.
+    let Some(thumb) = Dib::new(tw, th) else { return };
+    {
+        let Some(src) = Dib::from_image(&img) else { return };
+        unsafe {
+            SetStretchBltMode(thumb.dc, HALFTONE);
+            let _ = SetBrushOrgEx(thumb.dc, 0, 0, None);
+            let _ = StretchBlt(thumb.dc, 0, 0, tw, th, Some(src.dc), 0, 0, src.w, src.h, SRCCOPY);
+            let _ = GdiFlush();
+        }
+    } // full-size temporary freed here
+
     let st = Box::new(Toast {
-        img,
-        src,
+        img: Some(img),
         thumb,
+        thumb_at: ((w - tw) / 2, pad),
+        back: Dib::new(w, h),
         dpi,
         font_b: ui_font(sc(13, dpi), 600),
         font: ui_font(sc(12, dpi), 400),
@@ -114,45 +131,48 @@ fn paint(hwnd: HWND, st: &mut Toast) {
         let hdc = BeginPaint(hwnd, &mut ps);
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
-        if let Some(back) = Dib::new(rc.right, rc.bottom) {
+        if let Some(back) = st.back.as_ref() {
             let bg = if st.hot { argb(255, 44, 44, 50) } else { argb(255, 32, 32, 36) };
+            let (tx0, ty0) = st.thumb_at;
+            let (tw, th) = (st.thumb.w, st.thumb.h);
             if let Some(g) = Graphics::from_hdc(back.dc) {
                 g.fill_round_rect(0.0, 0.0, rc.right as f32, rc.bottom as f32, 0.0, bg);
             }
-            let t = st.thumb;
-            SetStretchBltMode(back.dc, HALFTONE);
-            let _ = SetBrushOrgEx(back.dc, 0, 0, None);
-            let _ = StretchBlt(
-                back.dc, t.left, t.top, t.right - t.left, t.bottom - t.top,
-                Some(st.src.dc), 0, 0, st.src.w, st.src.h, SRCCOPY,
-            );
+            let _ = BitBlt(back.dc, tx0, ty0, tw, th, Some(st.thumb.dc), 0, 0, SRCCOPY);
+            let dpi = st.dpi;
             if let Some(g) = Graphics::from_hdc(back.dc) {
                 g.stroke_round_rect(
-                    t.left as f32 - 0.5, t.top as f32 - 0.5,
-                    (t.right - t.left) as f32 + 1.0, (t.bottom - t.top) as f32 + 1.0,
+                    tx0 as f32 - 0.5, ty0 as f32 - 0.5, tw as f32 + 1.0, th as f32 + 1.0,
                     0.0, 1.0, argb(50, 255, 255, 255),
                 );
-                // Little accent check dot.
-                let cy = t.bottom as f32 + scf(22.0, st.dpi);
-                g.fill_ellipse(scf(18.0, st.dpi), cy, scf(4.0, st.dpi), argb(255, 0x34, 0xC7, 0x59));
+                // Green "done" dot beside the caption.
+                let cy = (ty0 + th) as f32 + scf(22.0, dpi);
+                g.fill_ellipse(scf(18.0, dpi), cy, scf(4.0, dpi), argb(255, 0x34, 0xC7, 0x59));
             }
-            let dpi = st.dpi;
             let tx = sc(30, dpi);
-            let row = t.bottom + sc(12, dpi);
+            let row = ty0 + th + sc(12, dpi);
             draw_text(
                 back.dc, "Copied to clipboard",
                 rect(tx, row, rc.right - sc(10, dpi), row + sc(20, dpi)),
                 st.font_b, argb(255, 245, 245, 250), DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );
-            let msg = if st.hot { "Click to mark up" } else { "Click to mark up \u{00B7} right-click to dismiss" };
             draw_text(
-                back.dc, msg,
+                back.dc, "Click to mark up \u{00B7} right-click to dismiss",
                 rect(tx, row + sc(18, dpi), rc.right - sc(10, dpi), row + sc(36, dpi)),
                 st.font, argb(255, 160, 160, 172), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
             );
             let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, Some(back.dc), 0, 0, SRCCOPY);
         }
         let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+fn set_hot(hwnd: HWND, st: &mut Toast, hot: bool) {
+    if st.hot != hot {
+        st.hot = hot;
+        unsafe {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
     }
 }
 
@@ -169,29 +189,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_MOUSEACTIVATE => LRESULT(MA_NOACTIVATE as isize),
         WM_MOUSEMOVE => {
             if !st.hot {
-                st.hot = true;
-                let _ = InvalidateRect(Some(hwnd), None, false);
+                let mut tme = TRACKMOUSEEVENT {
+                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                    dwFlags: TME_LEAVE,
+                    hwndTrack: hwnd,
+                    dwHoverTime: 0,
+                };
+                let _ = TrackMouseEvent(&mut tme);
             }
+            set_hot(hwnd, st, true);
+            LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            set_hot(hwnd, st, false);
+            // Restart the countdown so it doesn't vanish the instant the pointer leaves.
+            SetTimer(Some(hwnd), TIMER_CLOSE, 2000, None);
             LRESULT(0)
         }
         WM_TIMER => {
             // Stay open while the pointer is over the card.
-            let (x, y) = cursor_pos();
-            let mut wr = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut wr);
-            if pt_in(&wr, x, y) {
-                return LRESULT(0);
+            if !st.hot {
+                let _ = DestroyWindow(hwnd);
             }
-            if st.hot {
-                st.hot = false;
-            }
-            let _ = DestroyWindow(hwnd);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let img = st.img.clone();
+            let img = st.img.take();
             let _ = DestroyWindow(hwnd);
-            crate::editor::open(img);
+            if let Some(img) = img {
+                crate::editor::open(img);
+            }
             LRESULT(0)
         }
         WM_RBUTTONUP => {
@@ -206,6 +233,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     c.set(HWND(std::ptr::null_mut()));
                 }
             });
+            trim_memory();
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),

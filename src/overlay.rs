@@ -40,6 +40,8 @@ struct Overlay {
     toolbar: RECT,
     buttons: [RECT; 4],
     hot: Option<usize>,
+    pressed: Option<usize>, // toolbar button under mouse-down
+    armed: bool,            // window/screen click started on the overlay
     dpi: u32,
     font: HFONT,
     font_small: HFONT,
@@ -62,6 +64,12 @@ pub fn register() {
 pub fn start(mode: Mode) {
     if OPEN.with(|o| o.get()) {
         return;
+    }
+    // Make sure our own preview card isn't in the frozen frame.
+    if crate::toast::close_current() {
+        unsafe {
+            let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+        }
     }
     let Some(frozen) = capture::capture_screen() else { return };
     let (ox, oy) = frozen.origin;
@@ -103,6 +111,8 @@ pub fn start(mode: Mode) {
         toolbar: RECT::default(),
         buttons: [RECT::default(); 4],
         hot: None,
+        pressed: None,
+        armed: false,
         dpi,
         font,
         font_small,
@@ -132,13 +142,14 @@ pub fn start(mode: Mode) {
         set_state(hwnd, st);
         OPEN.with(|o| o.set(true));
         let _ = ShowWindow(hwnd, SW_SHOW);
-        let _ = SetForegroundWindow(hwnd);
+        let _ = UpdateWindow(hwnd); // paint synchronously: no blank frame
+        force_foreground(hwnd);
         let _ = SetFocus(Some(hwnd));
     }
 }
 
 fn layout_toolbar(st: &mut Overlay, mon: RECT) {
-    let labels = ["Region", "Window", "Screen", "\u{2715}"];
+    let labels = ["Region", "Window", "Screen", ""];
     let dpi = st.dpi;
     let pad = sc(14, dpi);
     let gap = sc(4, dpi);
@@ -247,16 +258,50 @@ fn invalidate(hwnd: HWND, r: Option<RECT>) {
     }
 }
 
+/// Repaint only what changed between two selections: the area that switched between
+/// dim and bright (XOR), both borders, and both size labels. Keeps big drags smooth.
+fn invalidate_change(hwnd: HWND, st: &Overlay, old: Option<RECT>, new: Option<RECT>) {
+    match (old, new) {
+        (Some(a), Some(b)) => unsafe {
+            let ra = CreateRectRgn(a.left, a.top, a.right, a.bottom);
+            let rb = CreateRectRgn(b.left, b.top, b.right, b.bottom);
+            let rx = CreateRectRgn(0, 0, 0, 0);
+            CombineRgn(Some(rx), Some(ra), Some(rb), RGN_XOR);
+            let _ = InvalidateRgn(hwnd, Some(rx), false);
+            let _ = DeleteObject(ra.into());
+            let _ = DeleteObject(rb.into());
+            let _ = DeleteObject(rx.into());
+            let p = sc(4, st.dpi);
+            for r in [a, b] {
+                for strip in [
+                    rect(r.left - p, r.top - p, r.right + p, r.top + p),
+                    rect(r.left - p, r.bottom - p, r.right + p, r.bottom + p),
+                    rect(r.left - p, r.top - p, r.left + p, r.bottom + p),
+                    rect(r.right - p, r.top - p, r.right + p, r.bottom + p),
+                ] {
+                    invalidate(hwnd, Some(strip));
+                }
+                invalidate(hwnd, Some(st.label_rect(r)));
+            }
+        },
+        (a, b) => {
+            invalidate(hwnd, st.decor_bounds(a));
+            invalidate(hwnd, st.decor_bounds(b));
+        }
+    }
+}
+
 fn set_mode(hwnd: HWND, st: &mut Overlay, mode: Mode) {
     if st.mode == mode {
         return;
     }
-    let old = st.decor_bounds(st.selection());
+    let old = st.selection();
     st.mode = mode;
     st.dragging = false;
+    st.armed = false;
     st.update_hover();
-    invalidate(hwnd, old);
-    invalidate(hwnd, st.decor_bounds(st.selection()));
+    let new = st.selection();
+    invalidate_change(hwnd, st, old, new);
     invalidate(hwnd, Some(st.toolbar));
 }
 
@@ -384,12 +429,21 @@ fn paint(hwnd: HWND, st: &mut Overlay) {
                         );
                     }
                 }
-                let _ = dpi;
             }
-            let labels = ["Region", "Window", "Screen", "\u{2715}"];
-            for (i, b) in st.buttons.iter().enumerate() {
+            let labels = ["Region", "Window", "Screen"];
+            for (i, b) in st.buttons.iter().take(3).enumerate() {
                 let c = if i == active { argb(255, 255, 255, 255) } else { argb(255, 200, 200, 210) };
                 draw_text(back, labels[i], *b, st.font, c, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            // Close button: a drawn X (no font dependency).
+            if let Some(g) = Graphics::from_hdc(back) {
+                let b = st.buttons[3];
+                let cx = (b.left + b.right) as f32 / 2.0;
+                let cy = (b.top + b.bottom) as f32 / 2.0;
+                let k = scf(5.0, dpi);
+                let c = if st.hot == Some(3) { argb(255, 255, 255, 255) } else { argb(255, 200, 200, 210) };
+                g.line(cx - k, cy - k, cx + k, cy + k, scf(1.6, dpi), c);
+                g.line(cx - k, cy + k, cx + k, cy - k, scf(1.6, dpi), c);
             }
         }
 
@@ -422,8 +476,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSEMOVE => {
             let (x, y) = lparam_point(lp);
-            let old_decor = st.decor_bounds(st.selection());
-            let old_hover = st.hover;
             let old_sel = st.selection();
             st.cur = (x, y);
 
@@ -435,26 +487,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if !st.dragging {
                 st.update_hover();
             }
-            if st.hover != old_hover || st.selection() != old_sel {
-                invalidate(hwnd, old_decor);
-                invalidate(hwnd, st.decor_bounds(st.selection()));
-                // Toolbar may overlap the selection.
-                invalidate(hwnd, Some(st.toolbar));
+            let new_sel = st.selection();
+            if new_sel != old_sel {
+                invalidate_change(hwnd, st, old_sel, new_sel);
             }
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
             let (x, y) = lparam_point(lp);
-            if let Some(i) = st.buttons.iter().position(|b| pt_in(b, x, y)) {
-                match i {
-                    0 => set_mode(hwnd, st, Mode::Region),
-                    1 => set_mode(hwnd, st, Mode::Window),
-                    2 => set_mode(hwnd, st, Mode::Screen),
-                    _ => cancel(hwnd),
-                }
-                return LRESULT(0);
-            }
+            st.pressed = None;
+            st.armed = false;
             if pt_in(&st.toolbar, x, y) {
+                st.pressed = st.buttons.iter().position(|b| pt_in(b, x, y));
                 return LRESULT(0);
             }
             match st.mode {
@@ -465,24 +509,47 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     SetCapture(hwnd);
                     invalidate(hwnd, st.decor_bounds(st.selection()));
                 }
-                _ => {
-                    if let Some(sel) = st.hover {
-                        finish(hwnd, sel);
-                    }
-                }
+                // Act on mouse-up so the app underneath never sees a stray button-up.
+                _ => st.armed = true,
             }
             LRESULT(0)
         }
         WM_LBUTTONUP => {
+            let (x, y) = lparam_point(lp);
+            if let Some(i) = st.pressed.take() {
+                if pt_in(&st.buttons[i], x, y) {
+                    match i {
+                        0 => set_mode(hwnd, st, Mode::Region),
+                        1 => set_mode(hwnd, st, Mode::Window),
+                        2 => set_mode(hwnd, st, Mode::Screen),
+                        _ => cancel(hwnd),
+                    }
+                }
+                return LRESULT(0);
+            }
             if st.mode == Mode::Region && st.dragging {
                 let _ = ReleaseCapture();
                 let sel = st.selection().map(|s| st.clamp(s));
                 let old = st.decor_bounds(st.selection());
                 st.dragging = false;
                 match sel {
-                    Some(s) if s.right - s.left >= 4 && s.bottom - s.top >= 4 => finish(hwnd, s),
+                    Some(s) if rect_w(&s) >= 4 && rect_h(&s) >= 4 => finish(hwnd, s),
                     _ => invalidate(hwnd, old),
                 }
+            } else if st.armed {
+                st.armed = false;
+                if let Some(sel) = st.hover {
+                    finish(hwnd, sel);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            // Lost the mouse mid-drag (rare): drop the drag instead of getting stuck.
+            if st.dragging && HWND(lp.0 as *mut _) != hwnd {
+                let old = st.decor_bounds(st.selection());
+                st.dragging = false;
+                invalidate(hwnd, old);
             }
             LRESULT(0)
         }
@@ -517,6 +584,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_NCDESTROY => {
             drop(take_state::<Overlay>(hwnd));
             OPEN.with(|o| o.set(false));
+            trim_memory();
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         _ => DefWindowProcW(hwnd, msg, wp, lp),

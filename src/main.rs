@@ -2,6 +2,9 @@
 //! Lives in the system tray; snips go straight to the clipboard.
 
 #![windows_subsystem = "windows"]
+// A misspelled/unimported constant in a `match` silently becomes a catch-all binding.
+// Make that a hard error instead of a warning.
+#![deny(unreachable_patterns, unused_variables)]
 
 mod capture;
 mod editor;
@@ -43,6 +46,7 @@ const HK_PRTSC: i32 = 2;
 const TIMER_SNIP: usize = 1;
 const TIMER_UPDATE_FIRST: usize = 2;
 const TIMER_UPDATE_PERIODIC: usize = 3;
+const TIMER_TRIM: usize = 4;
 const FIRST_CHECK_MS: u32 = 10_000;
 const PERIODIC_CHECK_MS: u32 = 6 * 60 * 60 * 1000;
 
@@ -90,7 +94,7 @@ pub fn host() -> HWND {
 
 /// Called by the overlay with the finished snip.
 pub fn on_snip(img: Image, screen_rect: RECT) {
-    copy_to_clipboard(host(), &img);
+    copy_to_clipboard(host(), &img.px, img.w, img.h);
     toast::show(img, screen_rect);
 }
 
@@ -110,6 +114,10 @@ fn main() {
         if w != WAIT_OBJECT_0 && w != WAIT_ABANDONED {
             let cls = WStr::new(HOST_CLASS);
             if let Ok(other) = FindWindowW(cls.p(), None) {
+                // We were just launched by the user, so we may pass on foreground rights.
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(other, Some(&mut pid));
+                let _ = AllowSetForegroundWindow(pid);
                 let _ = PostMessageW(Some(other), WM_APP_SNIP, WPARAM(0), LPARAM(0));
             }
             return;
@@ -167,6 +175,7 @@ fn main() {
         }
 
         SetTimer(Some(hwnd), TIMER_UPDATE_FIRST, FIRST_CHECK_MS, None);
+        SetTimer(Some(hwnd), TIMER_TRIM, 3_000, None);
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -177,7 +186,8 @@ fn main() {
     }
 }
 
-/// Ctrl+Alt+S always; Print Screen too when Windows isn't already using it.
+/// Ctrl+Alt+S always. Print Screen too, but only when the user has turned off Windows'
+/// own "Use the Print screen key to open screen capture" (otherwise both would open).
 fn register_hotkeys(hwnd: HWND) -> String {
     unsafe {
         let main_ok = RegisterHotKey(
@@ -187,7 +197,8 @@ fn register_hotkeys(hwnd: HWND) -> String {
             VK_S.0 as u32,
         )
         .is_ok();
-        let prtsc_ok = RegisterHotKey(Some(hwnd), HK_PRTSC, MOD_NOREPEAT, VK_SNAPSHOT.0 as u32).is_ok();
+        let prtsc_ok = !settings::windows_uses_prtscn()
+            && RegisterHotKey(Some(hwnd), HK_PRTSC, MOD_NOREPEAT, VK_SNAPSHOT.0 as u32).is_ok();
         match (main_ok, prtsc_ok) {
             (true, true) => "Ctrl+Alt+S or PrtScn".into(),
             (true, false) => "Ctrl+Alt+S".into(),
@@ -385,6 +396,10 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     updater::check_async(hwnd, WM_APP_CHECKED, false);
                 }
                 TIMER_UPDATE_PERIODIC => updater::check_async(hwnd, WM_APP_CHECKED, false),
+                TIMER_TRIM => {
+                    let _ = KillTimer(Some(hwnd), TIMER_TRIM);
+                    trim_memory();
+                }
                 _ => {}
             }
             LRESULT(0)

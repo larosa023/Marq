@@ -35,6 +35,30 @@ impl Graphics {
         }
     }
 
+    /// Map drawing coordinates: screen = (dx, dy) + p * scale.
+    pub fn set_transform(&self, dx: f32, dy: f32, scale: f32) {
+        unsafe {
+            GdipResetWorldTransform(self.0);
+            GdipTranslateWorldTransform(self.0, dx, dy, MatrixOrderPrepend);
+            GdipScaleWorldTransform(self.0, scale, scale, MatrixOrderPrepend);
+        }
+    }
+
+    /// Restrict drawing to a rectangle (device coordinates), on top of the DC's own clip.
+    pub fn clip(&self, x: i32, y: i32, w: i32, h: i32) {
+        unsafe {
+            GdipSetClipRectI(self.0, x, y, w, h, CombineModeIntersect);
+        }
+    }
+
+    pub fn line(&self, x1: f32, y1: f32, x2: f32, y2: f32, width: f32, color: u32) {
+        unsafe {
+            let pen = pen(color, width, false);
+            GdipDrawLine(self.0, pen, x1, y1, x2, y2);
+            GdipDeletePen(pen);
+        }
+    }
+
     pub fn fill_round_rect(&self, x: f32, y: f32, w: f32, h: f32, r: f32, color: u32) {
         unsafe {
             let path = round_rect_path(x, y, w, h, r);

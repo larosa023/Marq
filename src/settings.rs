@@ -50,3 +50,25 @@ pub fn refresh_autostart_path() {
         set_autostart(true);
     }
 }
+
+/// True unless the user turned off Windows' "Use the Print screen key to open screen
+/// capture" (HKCU\Control Panel\Keyboard\PrintScreenKeyForSnippingEnabled = 0).
+/// On current Windows 11 builds it's on by default even when the value is absent.
+pub fn windows_uses_prtscn() -> bool {
+    let key = WStr::new("Control Panel\\Keyboard");
+    let name = WStr::new("PrintScreenKeyForSnippingEnabled");
+    let mut data: u32 = 1;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let r = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            key.p(),
+            name.p(),
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut data as *mut u32 as *mut _),
+            Some(&mut size),
+        )
+    };
+    !(r.is_ok() && data == 0)
+}

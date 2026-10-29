@@ -102,20 +102,39 @@ fn install(version: &str, expected_sha: &str) -> InstallResult {
     let new_path = sibling(&exe, ".new");
     let old_path = sibling(&exe, ".old");
     if let Err(e) = std::fs::write(&new_path, &bytes) {
-        return InstallResult::Failed(permission_hint(e));
-    }
-    let _ = std::fs::remove_file(&old_path);
-    if let Err(e) = std::fs::rename(&exe, &old_path) {
         let _ = std::fs::remove_file(&new_path);
         return InstallResult::Failed(permission_hint(e));
     }
-    if let Err(e) = std::fs::rename(&new_path, &exe) {
+    drop(bytes);
+    let _ = retry(|| std::fs::remove_file(&old_path).or_else(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) }
+    }));
+    if let Err(e) = retry(|| std::fs::rename(&exe, &old_path)) {
+        let _ = std::fs::remove_file(&new_path);
+        return InstallResult::Failed(permission_hint(e));
+    }
+    if let Err(e) = retry(|| std::fs::rename(&new_path, &exe)) {
         // Roll back so the user is never left without an exe.
-        let _ = std::fs::rename(&old_path, &exe);
+        let _ = retry(|| std::fs::rename(&old_path, &exe));
         let _ = std::fs::remove_file(&new_path);
         return InstallResult::Failed(permission_hint(e));
     }
     InstallResult::Ready(exe)
+}
+
+/// Antivirus often holds a freshly written exe open for a moment while scanning it.
+/// Retry file operations for up to ~4 seconds before giving up.
+fn retry<T>(mut f: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut last = None;
+    for _ in 0..20 {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
+            Err(e) => last = Some(e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("retry failed")))
 }
 
 fn permission_hint(e: std::io::Error) -> String {
@@ -128,9 +147,11 @@ fn permission_hint(e: std::io::Error) -> String {
     }
 }
 
-/// Delete the previous exe left behind by an update (it may take a moment to unlock).
+/// Delete the previous exe left behind by an update (it may take a moment to unlock),
+/// plus any half-finished download.
 pub fn cleanup_old() {
     let Ok(exe) = std::env::current_exe() else { return };
+    let _ = std::fs::remove_file(sibling(&exe, ".new"));
     let old = sibling(&exe, ".old");
     if !old.exists() {
         return;

@@ -106,7 +106,18 @@ impl Dib {
             let dc = CreateCompatibleDC(Some(screen));
             ReleaseDC(None, screen);
             let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
-            let bmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+            let bmp = match CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0) {
+                Ok(b) if !bits.is_null() => b,
+                Ok(b) => {
+                    let _ = DeleteObject(b.into());
+                    let _ = DeleteDC(dc);
+                    return None;
+                }
+                Err(_) => {
+                    let _ = DeleteDC(dc);
+                    return None;
+                }
+            };
             let old = SelectObject(dc, bmp.into());
             Some(Dib { dc, bmp, old, bits: bits as *mut u32, w: w.max(1), h: h.max(1) })
         }
@@ -120,17 +131,6 @@ impl Dib {
 
     pub fn pixels_mut(&self) -> &mut [u32] {
         unsafe { std::slice::from_raw_parts_mut(self.bits, (self.w * self.h) as usize) }
-    }
-
-    pub fn to_image(&self) -> Image {
-        unsafe {
-            let _ = GdiFlush();
-        }
-        let mut px = self.pixels_mut().to_vec();
-        for p in px.iter_mut() {
-            *p |= 0xFF00_0000;
-        }
-        Image { w: self.w, h: self.h, px }
     }
 
     pub fn copy_from(&self, other: &Dib) {
@@ -155,13 +155,17 @@ impl Drop for Dib {
 // Clipboard
 // ---------------------------------------------------------------------------
 
-/// Put the image on the clipboard as a 24-bit CF_DIB (the most widely accepted format).
-pub fn copy_to_clipboard(owner: HWND, img: &Image) -> bool {
+/// Put pixels (top-down BGRA) on the clipboard as a 24-bit CF_DIB, the most widely accepted format.
+pub fn copy_to_clipboard(owner: HWND, px: &[u32], w: i32, h: i32) -> bool {
+    if w <= 0 || h <= 0 || px.len() < (w as usize) * (h as usize) {
+        return false;
+    }
     unsafe {
-        let stride = ((img.w * 3 + 3) & !3) as usize;
+        let (wu, hu) = (w as usize, h as usize);
+        let stride = (wu * 3 + 3) & !3;
         let hdr = std::mem::size_of::<BITMAPINFOHEADER>();
-        let size = hdr + stride * img.h as usize;
-        let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, size) else { return false };
+        let size = hdr + stride * hu;
+        let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size) else { return false };
         let p = GlobalLock(hmem) as *mut u8;
         if p.is_null() {
             let _ = GlobalFree(Some(hmem));
@@ -169,24 +173,22 @@ pub fn copy_to_clipboard(owner: HWND, img: &Image) -> bool {
         }
         let header = BITMAPINFOHEADER {
             biSize: hdr as u32,
-            biWidth: img.w,
-            biHeight: img.h, // bottom-up
+            biWidth: w,
+            biHeight: h, // bottom-up
             biPlanes: 1,
             biBitCount: 24,
             biCompression: BI_RGB.0,
-            biSizeImage: (stride * img.h as usize) as u32,
+            biSizeImage: (stride * hu) as u32,
             ..Default::default()
         };
         std::ptr::copy_nonoverlapping(&header as *const _ as *const u8, p, hdr);
-        let data = std::slice::from_raw_parts_mut(p.add(hdr), stride * img.h as usize);
-        for y in 0..img.h as usize {
-            let src = &img.px[y * img.w as usize..(y + 1) * img.w as usize];
-            let dst_row = (img.h as usize - 1 - y) * stride;
-            for (x, &c) in src.iter().enumerate() {
-                let o = dst_row + x * 3;
-                data[o] = (c & 0xFF) as u8;
-                data[o + 1] = ((c >> 8) & 0xFF) as u8;
-                data[o + 2] = ((c >> 16) & 0xFF) as u8;
+        let data = std::slice::from_raw_parts_mut(p.add(hdr), stride * hu);
+        for (y, src) in px.chunks_exact(wu).take(hu).enumerate() {
+            let row = &mut data[(hu - 1 - y) * stride..][..wu * 3];
+            for (dst, &c) in row.chunks_exact_mut(3).zip(src) {
+                dst[0] = c as u8;
+                dst[1] = (c >> 8) as u8;
+                dst[2] = (c >> 16) as u8;
             }
         }
         let _ = GlobalUnlock(hmem);
@@ -205,6 +207,7 @@ pub fn copy_to_clipboard(owner: HWND, img: &Image) -> bool {
             return false;
         }
         let _ = EmptyClipboard();
+        // On success the clipboard owns the memory; only free it if the hand-off failed.
         let ok = SetClipboardData(CF_DIB.0 as u32, Some(HANDLE(hmem.0))).is_ok();
         let _ = CloseClipboard();
         if !ok {
@@ -339,12 +342,63 @@ pub fn hinstance() -> HINSTANCE {
     }
 }
 
+/// The app icon at a given size. LR_SHARED: the system caches it, so repeated calls don't leak.
 pub fn app_icon(size: i32) -> HICON {
     unsafe {
-        LoadImageW(Some(hinstance()), PCWSTR(1 as *const u16), IMAGE_ICON, size, size, LR_DEFAULTCOLOR)
+        LoadImageW(Some(hinstance()), PCWSTR(1 as *const u16), IMAGE_ICON, size, size, LR_SHARED)
             .map(|h| HICON(h.0))
             .unwrap_or_else(|_| LoadIconW(None, IDI_APPLICATION).unwrap_or_default())
     }
+}
+
+/// Bring a window to the front. If Windows' foreground lock refuses, a synthetic Alt tap
+/// (the documented way input unlocks it) lets the second attempt succeed.
+pub fn force_foreground(hwnd: HWND) {
+    use windows::Win32::UI::Input::KeyboardAndMouse::*;
+    unsafe {
+        let _ = SetForegroundWindow(hwnd);
+        if GetForegroundWindow() == hwnd {
+            return;
+        }
+        let key = |flags| INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT { wVk: VK_MENU, dwFlags: flags, ..Default::default() },
+            },
+        };
+        let inputs = [key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)];
+        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        let _ = SetForegroundWindow(hwnd);
+        let _ = SetFocus(Some(hwnd));
+    }
+}
+
+/// Hand freed pages back to Windows so the idle footprint stays tiny.
+pub fn trim_memory() {
+    use windows::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+    unsafe {
+        let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+}
+
+pub fn rect_w(r: &RECT) -> i32 {
+    r.right - r.left
+}
+pub fn rect_h(r: &RECT) -> i32 {
+    r.bottom - r.top
+}
+pub fn union(a: RECT, b: RECT) -> RECT {
+    if rect_w(&a) <= 0 || rect_h(&a) <= 0 {
+        return b;
+    }
+    if rect_w(&b) <= 0 || rect_h(&b) <= 0 {
+        return a;
+    }
+    rect(a.left.min(b.left), a.top.min(b.top), a.right.max(b.right), a.bottom.max(b.bottom))
+}
+pub fn intersect(a: RECT, b: RECT) -> Option<RECT> {
+    let r = rect(a.left.max(b.left), a.top.max(b.top), a.right.min(b.right), a.bottom.min(b.bottom));
+    if rect_w(&r) > 0 && rect_h(&r) > 0 { Some(r) } else { None }
 }
 
 /// Store / fetch a boxed per-window state pointer in GWLP_USERDATA.

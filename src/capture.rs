@@ -23,7 +23,7 @@ pub fn capture_screen() -> Option<Frozen> {
         let h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
         let dib = Dib::new(w, h)?;
         let screen = GetDC(None);
-        let _ = BitBlt(dib.dc, 0, 0, w, h, Some(screen), x, y, SRCCOPY | CAPTUREBLT);
+        let _ = BitBlt(dib.dc, 0, 0, w, h, Some(screen), x, y, SRCCOPY); // no CAPTUREBLT: it makes the cursor flicker, and DWM already composes layered windows
         ReleaseDC(None, screen);
         let _ = GdiFlush();
         for p in dib.pixels_mut().iter_mut() {
