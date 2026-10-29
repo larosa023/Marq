@@ -123,7 +123,9 @@ impl Dib {
     }
 
     pub fn to_image(&self) -> Image {
-        unsafe { GdiFlush() };
+        unsafe {
+            let _ = GdiFlush();
+        }
         let mut px = self.pixels_mut().to_vec();
         for p in px.iter_mut() {
             *p |= 0xFF00_0000;
@@ -132,7 +134,9 @@ impl Dib {
     }
 
     pub fn copy_from(&self, other: &Dib) {
-        unsafe { GdiFlush() };
+        unsafe {
+            let _ = GdiFlush();
+        }
         self.pixels_mut().copy_from_slice(other.pixels_mut());
     }
 }

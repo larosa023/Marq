@@ -25,7 +25,7 @@ pub fn capture_screen() -> Option<Frozen> {
         let screen = GetDC(None);
         let _ = BitBlt(dib.dc, 0, 0, w, h, Some(screen), x, y, SRCCOPY | CAPTUREBLT);
         ReleaseDC(None, screen);
-        GdiFlush();
+        let _ = GdiFlush();
         for p in dib.pixels_mut().iter_mut() {
             *p |= 0xFF00_0000;
         }

@@ -1,0 +1,91 @@
+# Builds Marq on Windows for every push to main.
+# If the version in Cargo.toml doesn't have a release yet, publishes one with:
+#   Marq.exe    - the app
+#   latest.txt  - version + SHA-256, read by Marq's tray updater
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read version
+        id: ver
+        run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION is already released; this run only checks that it builds."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "v$VERSION is new; it will be released."
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Set up Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Build
+        run: |
+          set -o pipefail
+          if ! cargo build --release --locked 2>&1 | tee build.log; then
+            # Surface compiler errors as annotations on the run page.
+            grep -A6 '^error' build.log | head -60 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          fi
+
+      - name: Test
+        run: cargo test --release --locked
+
+      - name: Package
+        run: |
+          cp target/release/marq.exe Marq.exe
+          SHA=$(sha256sum Marq.exe | cut -d' ' -f1)
+          printf '%s\n%s\n' "${{ steps.ver.outputs.version }}" "$SHA" > latest.txt
+          cat latest.txt
+          ls -l Marq.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Marq-${{ steps.ver.outputs.version }}
+          path: |
+            Marq.exe
+            latest.txt
+
+      - name: Publish release
+        if: steps.ver.outputs.exists == 'false'
+        run: |
+          gh release create "v${{ steps.ver.outputs.version }}" Marq.exe latest.txt \
+            --title "Marq v${{ steps.ver.outputs.version }}" \
+            --target "${{ github.sha }}" \
+            --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

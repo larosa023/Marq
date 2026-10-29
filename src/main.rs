@@ -34,6 +34,9 @@ const WM_APP_SNIP: u32 = WM_APP + 2; // from a second instance; wParam = mode
 const WM_APP_CHECKED: u32 = WM_APP + 3; // lParam = Box<CheckResult>
 const WM_APP_INSTALLED: u32 = WM_APP + 4; // lParam = Box<InstallResult>
 
+// NIN_SELECT | NINF_KEY (not exported by the bindings).
+const NIN_KEYSELECT: u32 = NIN_SELECT | 0x1;
+
 const HK_REGION: i32 = 1;
 const HK_PRTSC: i32 = 2;
 

@@ -234,7 +234,7 @@ fn http_get(host: &str, path: &str) -> Result<Vec<u8>, String> {
             None,
             Some(&mut status as *mut u32 as *mut _),
             &mut len,
-            None,
+            std::ptr::null_mut(),
         );
         if status == 404 {
             return Err("No release has been published on GitHub yet.".into());
