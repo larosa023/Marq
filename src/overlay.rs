@@ -296,13 +296,19 @@ fn set_mode(hwnd: HWND, st: &mut Overlay, mode: Mode) {
         return;
     }
     let old = st.selection();
+    if st.dragging {
+        st.dragging = false;
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+    }
     st.mode = mode;
-    st.dragging = false;
     st.armed = false;
     st.update_hover();
     let new = st.selection();
     invalidate_change(hwnd, st, old, new);
     invalidate(hwnd, Some(st.toolbar));
+    update_cursor(st);
 }
 
 /// Crop the chosen rectangle, close the overlay and hand the image to the app.
@@ -328,12 +334,47 @@ fn cancel(hwnd: HWND) {
     }
 }
 
+/// Paint each rectangle of the update region on its own. BeginPaint only reports the
+/// bounding box, which during a drag is most of the screen even though only thin
+/// strips changed.
 fn paint(hwnd: HWND, st: &mut Overlay) {
     unsafe {
+        let mut rects: Vec<RECT> = Vec::new();
+        let rgn = CreateRectRgn(0, 0, 0, 0);
+        if GetUpdateRgn(hwnd, rgn, false) == COMPLEXREGION {
+            let size = GetRegionData(rgn, 0, None);
+            if size as usize > std::mem::size_of::<RGNDATAHEADER>() {
+                let mut buf = vec![0u8; size as usize];
+                let rd = buf.as_mut_ptr() as *mut RGNDATA;
+                if GetRegionData(rgn, size, Some(rd)) != 0 {
+                    let hdr = &(*rd).rdh;
+                    let first = buf.as_ptr().add(hdr.dwSize as usize) as *const RECT;
+                    let n = hdr.nCount as usize;
+                    if n <= 64 {
+                        rects.extend_from_slice(std::slice::from_raw_parts(first, n));
+                    }
+                }
+            }
+        }
+        let _ = DeleteObject(rgn.into());
+
         let mut ps = PAINTSTRUCT::default();
         let hdc = BeginPaint(hwnd, &mut ps);
-        let rc = ps.rcPaint;
-        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        if rects.is_empty() {
+            rects.push(ps.rcPaint);
+        }
+        for rc in rects {
+            compose(st, rc);
+            let _ = BitBlt(hdc, rc.left, rc.top, rect_w(&rc), rect_h(&rc), Some(st.back.dc), rc.left, rc.top, SRCCOPY);
+        }
+        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+/// Render one rectangle of the overlay into the back buffer.
+fn compose(st: &Overlay, rc: RECT) {
+    unsafe {
+        let (w, h) = (rect_w(&rc), rect_h(&rc));
         let back = st.back.dc;
 
         // 1. Dimmed screen.
@@ -357,6 +398,7 @@ fn paint(hwnd: HWND, st: &mut Overlay) {
             }
             let lbl = st.label_rect(sel);
             if let Some(g) = Graphics::from_hdc(back) {
+                g.clip(rc.left, rc.top, w, h);
                 let bw = scf(2.0, st.dpi);
                 g.stroke_round_rect(
                     sel.left as f32 - bw / 2.0,
@@ -391,6 +433,7 @@ fn paint(hwnd: HWND, st: &mut Overlay) {
                 Mode::Screen => 2,
             };
             if let Some(g) = Graphics::from_hdc(back) {
+                g.clip(rc.left, rc.top, w, h);
                 let r = (t.bottom - t.top) as f32 / 2.0;
                 g.fill_round_rect(
                     t.left as f32,
@@ -437,6 +480,7 @@ fn paint(hwnd: HWND, st: &mut Overlay) {
             }
             // Close button: a drawn X (no font dependency).
             if let Some(g) = Graphics::from_hdc(back) {
+                g.clip(rc.left, rc.top, w, h);
                 let b = st.buttons[3];
                 let cx = (b.left + b.right) as f32 / 2.0;
                 let cy = (b.top + b.bottom) as f32 / 2.0;
@@ -447,8 +491,20 @@ fn paint(hwnd: HWND, st: &mut Overlay) {
             }
         }
 
-        let _ = BitBlt(hdc, rc.left, rc.top, w, h, Some(back), rc.left, rc.top, SRCCOPY);
-        let _ = EndPaint(hwnd, &ps);
+    }
+}
+
+fn update_cursor(st: &Overlay) {
+    let (x, y) = st.cur;
+    let c = if pt_in(&st.toolbar, x, y) {
+        IDC_HAND
+    } else if st.mode == Mode::Region {
+        IDC_CROSS
+    } else {
+        IDC_HAND
+    };
+    unsafe {
+        SetCursor(LoadCursorW(None, c).ok());
     }
 }
 
@@ -463,21 +519,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_SETCURSOR => {
-            let (x, y) = st.cur;
-            let c = if pt_in(&st.toolbar, x, y) {
-                IDC_HAND
-            } else if st.mode == Mode::Region {
-                IDC_CROSS
-            } else {
-                IDC_HAND
-            };
-            SetCursor(LoadCursorW(None, c).ok());
+            // WM_SETCURSOR arrives before WM_MOUSEMOVE, so read the live position.
+            let (x, y) = cursor_pos();
+            let (ox, oy) = st.frozen.origin;
+            st.cur = (x - ox, y - oy);
+            update_cursor(st);
             LRESULT(1)
         }
         WM_MOUSEMOVE => {
             let (x, y) = lparam_point(lp);
             let old_sel = st.selection();
             st.cur = (x, y);
+            if st.dragging && (wp.0 & 0x0001) == 0 /* MK_LBUTTON */ {
+                // Button released somewhere we didn't hear about: end the drag cleanly.
+                st.dragging = false;
+                let _ = ReleaseCapture();
+            }
 
             let hot = st.buttons.iter().position(|b| pt_in(b, x, y));
             if hot != st.hot {
@@ -576,9 +633,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_KILLFOCUS => {
             // Don't leave a frozen screen hanging if the user alt-tabs away.
             // Posted (not immediate) so it's harmless while we're already closing.
-            if !st.dragging {
-                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
-            }
+            let _ = st;
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
             LRESULT(0)
         }
         WM_NCDESTROY => {

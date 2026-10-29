@@ -20,6 +20,7 @@ thread_local! {
 }
 
 struct Toast {
+    copied: bool,
     img: Option<Image>, // handed to the editor on click
     thumb: Dib,         // pre-scaled once, so painting is a plain blit
     thumb_at: (i32, i32),
@@ -56,7 +57,7 @@ pub fn close_current() -> bool {
 }
 
 /// Show the card near the bottom-right of the monitor where the snip was taken.
-pub fn show(img: Image, near: RECT) {
+pub fn show(img: Image, near: RECT, copied: bool) {
     close_current();
     let cx = (near.left + near.right) / 2;
     let cy = (near.top + near.bottom) / 2;
@@ -88,6 +89,7 @@ pub fn show(img: Image, near: RECT) {
     } // full-size temporary freed here
 
     let st = Box::new(Toast {
+        copied,
         img: Some(img),
         thumb,
         thumb_at: ((w - tw) / 2, pad),
@@ -147,17 +149,19 @@ fn paint(hwnd: HWND, st: &mut Toast) {
                 );
                 // Green "done" dot beside the caption.
                 let cy = (ty0 + th) as f32 + scf(22.0, dpi);
-                g.fill_ellipse(scf(18.0, dpi), cy, scf(4.0, dpi), argb(255, 0x34, 0xC7, 0x59));
+                let dot = if st.copied { argb(255, 0x34, 0xC7, 0x59) } else { argb(255, 0xFF, 0x9F, 0x0A) };
+                g.fill_ellipse(scf(18.0, dpi), cy, scf(4.0, dpi), dot);
             }
             let tx = sc(30, dpi);
             let row = ty0 + th + sc(12, dpi);
             draw_text(
-                back.dc, "Copied to clipboard",
+                back.dc, if st.copied { "Copied to clipboard" } else { "Couldn't reach the clipboard" },
                 rect(tx, row, rc.right - sc(10, dpi), row + sc(20, dpi)),
                 st.font_b, argb(255, 245, 245, 250), DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );
             draw_text(
-                back.dc, "Click to mark up \u{00B7} right-click to dismiss",
+                back.dc,
+                if st.copied { "Click to mark up \u{00B7} right-click to dismiss" } else { "Click to open it and copy again" },
                 rect(tx, row + sc(18, dpi), rc.right - sc(10, dpi), row + sc(36, dpi)),
                 st.font, argb(255, 160, 160, 172), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
             );

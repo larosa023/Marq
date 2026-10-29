@@ -10,8 +10,19 @@ const VALUE: &str = "Marq";
 fn open_run_key() -> Option<HKEY> {
     let key = WStr::new(RUN_KEY);
     let mut hkey = HKEY::default();
+    // Create-or-open: on a fresh profile the Run key may not exist yet.
     let r = unsafe {
-        RegOpenKeyExW(HKEY_CURRENT_USER, key.p(), Some(0), KEY_READ | KEY_WRITE, &mut hkey)
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            key.p(),
+            Some(0),
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_READ | KEY_WRITE,
+            None,
+            &mut hkey,
+            None,
+        )
     };
     if r.is_ok() { Some(hkey) } else { None }
 }

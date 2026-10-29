@@ -30,12 +30,15 @@ jobs:
         run: |
           VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          if gh release view "v$VERSION" >/dev/null 2>&1; then
+          # "Released" means published (not draft) AND both updater assets are present.
+          ASSETS=$(gh release view "v$VERSION" --json isDraft,assets \
+            --jq 'select(.isDraft == false) | [.assets[].name] | join(",")' 2>/dev/null || true)
+          if [[ "$ASSETS" == *Marq.exe* && "$ASSETS" == *latest.txt* ]]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "v$VERSION is already released; this run only checks that it builds."
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
-            echo "v$VERSION is new; it will be released."
+            echo "v$VERSION is not fully released yet; it will be published."
           fi
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,7 +57,7 @@ jobs:
       - name: Build
         run: |
           set -o pipefail
-          if ! cargo build --release --locked 2>&1 | tee build.log; then
+          if ! cargo build --release 2>&1 | tee build.log; then
             # Surface compiler errors as annotations on the run page.
             grep -A6 '^error' build.log | head -60 | while IFS= read -r line; do
               echo "::error::$line"
@@ -63,7 +66,7 @@ jobs:
           fi
 
       - name: Test
-        run: cargo test --release --locked
+        run: cargo test --release
 
       - name: Package
         run: |
@@ -80,12 +83,20 @@ jobs:
             Marq.exe
             latest.txt
 
+      # Draft first, upload, then go live: clients never see a release missing its files.
       - name: Publish release
         if: steps.ver.outputs.exists == 'false'
         run: |
-          gh release create "v${{ steps.ver.outputs.version }}" Marq.exe latest.txt \
-            --title "Marq v${{ steps.ver.outputs.version }}" \
-            --target "${{ github.sha }}" \
-            --generate-notes
+          TAG="v${{ steps.ver.outputs.version }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --draft=true
+          else
+            gh release create "$TAG" --draft \
+              --title "Marq $TAG" \
+              --target "${{ github.sha }}" \
+              --generate-notes
+          fi
+          gh release upload "$TAG" Marq.exe latest.txt --clobber
+          gh release edit "$TAG" --draft=false --latest
         env:
           GH_TOKEN: ${{ github.token }}

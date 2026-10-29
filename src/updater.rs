@@ -9,6 +9,7 @@
 
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use sha2::{Digest, Sha256};
 use windows::Win32::Foundation::*;
@@ -32,40 +33,57 @@ pub enum InstallResult {
     Failed(String),
 }
 
-/// Check in the background; posts `msg` to `hwnd` with a `Box<CheckResult>` in LPARAM.
+pub enum Event {
+    Checked { manual: bool, result: CheckResult },
+    Installed(InstallResult),
+}
+
+/// Results from worker threads wait here; the UI thread drains them when poked.
+/// (Safer than smuggling raw pointers through window messages.)
+static EVENTS: Mutex<Vec<Event>> = Mutex::new(Vec::new());
+
+pub fn take_events() -> Vec<Event> {
+    EVENTS.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default()
+}
+
+fn deliver(hwnd: isize, msg: u32, ev: Event) {
+    if let Ok(mut v) = EVENTS.lock() {
+        v.push(ev);
+    }
+    unsafe {
+        let _ = PostMessageW(Some(HWND(hwnd as *mut _)), msg, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Check in the background; posts `msg` to `hwnd` when an Event is ready.
 pub fn check_async(hwnd: HWND, msg: u32, manual: bool) {
     let h = hwnd.0 as isize;
     std::thread::spawn(move || {
-        let res = check();
-        let boxed = Box::into_raw(Box::new(res));
-        unsafe {
-            if PostMessageW(Some(HWND(h as *mut _)), msg, WPARAM(manual as usize), LPARAM(boxed as isize)).is_err() {
-                drop(Box::from_raw(boxed));
-            }
-        }
+        let result = check();
+        deliver(h, msg, Event::Checked { manual, result });
     });
 }
 
-/// Download + verify + swap in the background; posts `msg` with a `Box<InstallResult>`.
+/// Download + verify + swap in the background; posts `msg` when an Event is ready.
 pub fn install_async(hwnd: HWND, msg: u32, version: String, sha256: String) {
     let h = hwnd.0 as isize;
     std::thread::spawn(move || {
-        let res = install(&version, &sha256);
-        let boxed = Box::into_raw(Box::new(res));
-        unsafe {
-            if PostMessageW(Some(HWND(h as *mut _)), msg, WPARAM(0), LPARAM(boxed as isize)).is_err() {
-                drop(Box::from_raw(boxed));
-            }
-        }
+        let result = install(&version, &sha256);
+        deliver(h, msg, Event::Installed(result));
     });
 }
 
-fn asset_path(name: &str) -> String {
+fn latest_asset_path(name: &str) -> String {
     format!("/{}/{}/releases/latest/download/{}", REPO_OWNER, REPO_NAME, name)
 }
 
+/// The exact version we checked, so a release published in between can't mismatch the hash.
+fn versioned_asset_path(version: &str, name: &str) -> String {
+    format!("/{}/{}/releases/download/v{}/{}", REPO_OWNER, REPO_NAME, version, name)
+}
+
 fn check() -> CheckResult {
-    let body = match http_get("github.com", &asset_path("latest.txt")) {
+    let body = match http_get("github.com", &latest_asset_path("latest.txt")) {
         Ok(b) => b,
         Err(e) => return CheckResult::Failed(e),
     };
@@ -88,7 +106,7 @@ fn install(version: &str, expected_sha: &str) -> InstallResult {
         Ok(p) => p,
         Err(e) => return InstallResult::Failed(format!("Couldn't locate Marq.exe ({e}).")),
     };
-    let bytes = match http_get("github.com", &asset_path("Marq.exe")) {
+    let bytes = match http_get("github.com", &versioned_asset_path(version, "Marq.exe")) {
         Ok(b) => b,
         Err(e) => return InstallResult::Failed(e),
     };

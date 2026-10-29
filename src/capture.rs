@@ -66,6 +66,17 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lp: LPARAM) -> BOOL {
     if ex & WS_EX_TRANSPARENT.0 != 0 {
         return BOOL(1);
     }
+    // Invisible layered windows (alpha 0) some apps keep around: not something to snip.
+    if ex & WS_EX_LAYERED.0 != 0 {
+        let mut alpha = 255u8;
+        let mut flags = LAYERED_WINDOW_ATTRIBUTES_FLAGS(0);
+        if GetLayeredWindowAttributes(hwnd, None, Some(&mut alpha), Some(&mut flags)).is_ok()
+            && (flags.0 & LWA_ALPHA.0) != 0
+            && alpha == 0
+        {
+            return BOOL(1);
+        }
+    }
     // Skip the desktop itself; hovering empty desktop falls back to the monitor.
     let mut cls = [0u16; 64];
     let n = GetClassNameW(hwnd, &mut cls);

@@ -16,6 +16,9 @@ use crate::util::*;
 
 const CLASS: &str = "MarqEditor";
 const TIMER_STATUS: usize = 1;
+const TIMER_COPY: usize = 2;
+/// Copy shortly after the last change, so quick strokes don't each land in Win+V history.
+const COPY_DELAY_MS: u32 = 600;
 const ACCENT: u32 = argb(255, 0x8B, 0x6F, 0xFF);
 const BG: u32 = argb(255, 24, 24, 27);
 const BAR: u32 = argb(255, 32, 32, 36);
@@ -79,6 +82,7 @@ struct Editor {
     buttons: Vec<(Btn, RECT)>,
     hot: Option<usize>,
     copied: bool,
+    copy_pending: bool,
 }
 
 impl Drop for Editor {
@@ -130,6 +134,7 @@ pub fn open(img: Image) {
         buttons: Vec::new(),
         hot: None,
         copied: false,
+        copy_pending: false,
     });
 
     unsafe {
@@ -317,7 +322,9 @@ fn rebuild_committed(st: &mut Editor) {
 }
 
 fn copy_now(hwnd: HWND, st: &mut Editor) {
+    st.copy_pending = false;
     unsafe {
+        let _ = KillTimer(Some(hwnd), TIMER_COPY);
         let _ = GdiFlush();
     }
     if copy_to_clipboard(hwnd, st.committed.pixels_mut(), st.committed.w, st.committed.h) {
@@ -371,7 +378,10 @@ fn committed_changed(hwnd: HWND, st: &mut Editor) {
     }
     rebuild_display(st);
     invalidate(hwnd, st.view);
-    copy_now(hwnd, st);
+    st.copy_pending = true;
+    unsafe {
+        SetTimer(Some(hwnd), TIMER_COPY, COPY_DELAY_MS, None);
+    }
 }
 
 fn undo(hwnd: HWND, st: &mut Editor) {
@@ -487,6 +497,15 @@ fn finish_stroke(hwnd: HWND, st: &mut Editor) {
     unsafe {
         let _ = ReleaseCapture();
     }
+    if s.tool == Tool::Arrow {
+        let (a, b) = (s.pts[0], s.pts[s.pts.len() - 1]);
+        if ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt() * st.scale < 6.0 {
+            // A click, not an arrow: discard it.
+            invalidate(hwnd, st.current_dirty);
+            st.current_dirty = RECT::default();
+            return;
+        }
+    }
     if let Some(g) = Graphics::from_hdc(st.committed.dc) {
         draw_stroke(&g, &s);
     }
@@ -556,8 +575,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let s = Stroke {
                     tool: st.tool,
                     color: COLORS[st.color],
-                    width: stroke_width(st.tool, st.dpi),
-                    pts: vec![p, p],
+                    // Same thickness on screen no matter how far the view is zoomed out.
+                    width: stroke_width(st.tool, st.dpi) / st.scale,
+                    // Pen/highlighter start as a single point, so a click leaves a dot.
+                    pts: if st.tool == Tool::Arrow { vec![p, p] } else { vec![p] },
                 };
                 st.current_dirty = screen_bounds(st, &s.pts, s.reach());
                 st.current = Some(s);
@@ -638,15 +659,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_TIMER => {
-            if wp.0 == TIMER_STATUS {
-                let _ = KillTimer(Some(hwnd), TIMER_STATUS);
-                st.copied = false;
-                invalidate(hwnd, bar_rect(hwnd, st));
+            match wp.0 {
+                TIMER_STATUS => {
+                    let _ = KillTimer(Some(hwnd), TIMER_STATUS);
+                    st.copied = false;
+                    invalidate(hwnd, bar_rect(hwnd, st));
+                }
+                TIMER_COPY => copy_now(hwnd, st),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            // Closing right after a stroke: still put the final image on the clipboard.
+            if st.current.is_some() {
+                finish_stroke(hwnd, st);
+            }
+            if st.copy_pending {
+                let _ = GdiFlush();
+                copy_to_clipboard(crate::host(), st.committed.pixels_mut(), st.committed.w, st.committed.h);
+                st.copy_pending = false;
             }
             LRESULT(0)
         }
         WM_NCDESTROY => {
             let _ = KillTimer(Some(hwnd), TIMER_STATUS);
+            let _ = KillTimer(Some(hwnd), TIMER_COPY);
             drop(take_state::<Editor>(hwnd));
             trim_memory();
             DefWindowProcW(hwnd, msg, wp, lp)

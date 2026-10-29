@@ -26,7 +26,7 @@ use windows::Win32::UI::Shell::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use overlay::Mode;
-use updater::{CheckResult, InstallResult};
+use updater::{CheckResult, Event, InstallResult};
 use util::*;
 
 const HOST_CLASS: &str = "MarqHost";
@@ -34,8 +34,7 @@ const MUTEX_NAME: &str = "Local\\MarqSingleInstance-7f3a";
 
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_SNIP: u32 = WM_APP + 2; // from a second instance; wParam = mode
-const WM_APP_CHECKED: u32 = WM_APP + 3; // lParam = Box<CheckResult>
-const WM_APP_INSTALLED: u32 = WM_APP + 4; // lParam = Box<InstallResult>
+const WM_APP_UPDATER: u32 = WM_APP + 3; // updater::take_events() has results
 
 // NIN_SELECT | NINF_KEY (not exported by the bindings).
 const NIN_KEYSELECT: u32 = NIN_SELECT | 0x1;
@@ -47,6 +46,7 @@ const TIMER_SNIP: usize = 1;
 const TIMER_UPDATE_FIRST: usize = 2;
 const TIMER_UPDATE_PERIODIC: usize = 3;
 const TIMER_TRIM: usize = 4;
+const TIMER_TRAY_RETRY: usize = 5;
 const FIRST_CHECK_MS: u32 = 10_000;
 const PERIODIC_CHECK_MS: u32 = 6 * 60 * 60 * 1000;
 
@@ -94,8 +94,8 @@ pub fn host() -> HWND {
 
 /// Called by the overlay with the finished snip.
 pub fn on_snip(img: Image, screen_rect: RECT) {
-    copy_to_clipboard(host(), &img.px, img.w, img.h);
-    toast::show(img, screen_rect);
+    let copied = copy_to_clipboard(host(), &img.px, img.w, img.h);
+    toast::show(img, screen_rect, copied);
 }
 
 fn main() {
@@ -109,7 +109,7 @@ fn main() {
         // Single instance. Launching Marq again just starts a snip in the running copy.
         let name = WStr::new(MUTEX_NAME);
         let Ok(mutex) = CreateMutexW(None, false, name.p()) else { return };
-        let wait_ms = if updated { 15_000 } else { 0 };
+        let wait_ms = if updated { 30_000 } else { 0 };
         let w = WaitForSingleObject(mutex, wait_ms);
         if w != WAIT_OBJECT_0 && w != WAIT_ABANDONED {
             let cls = WStr::new(HOST_CLASS);
@@ -158,7 +158,9 @@ fn main() {
             a.hotkey_label = hotkey_label;
         });
 
-        add_tray_icon(hwnd);
+        if !add_tray_icon(hwnd) {
+            SetTimer(Some(hwnd), TIMER_TRAY_RETRY, 2_000, None);
+        }
         updater::cleanup_old();
         settings::refresh_autostart_path();
 
@@ -219,7 +221,8 @@ fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
     nid
 }
 
-fn add_tray_icon(hwnd: HWND) {
+/// Add the tray icon. Returns false if Explorer wasn't ready (common right at login).
+fn add_tray_icon(hwnd: HWND) -> bool {
     unsafe {
         let mut nid = tray_data(hwnd);
         nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
@@ -228,8 +231,13 @@ fn add_tray_icon(hwnd: HWND) {
         nid.hIcon = app_icon(GetSystemMetricsForDpi(SM_CXSMICON, dpi));
         let hk = APP.with(|a| a.borrow().hotkey_label.clone());
         fill_wide(&mut nid.szTip, &format!("Marq \u{2014} {hk} to snip"));
-        let _ = Shell_NotifyIconW(NIM_ADD, &nid);
-        let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        let ok = Shell_NotifyIconW(NIM_ADD, &nid).as_bool()
+            // Already there (e.g. TaskbarCreated raced us): just refresh it.
+            || Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
+        if ok {
+            let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        }
+        ok
     }
 }
 
@@ -275,11 +283,11 @@ fn start_install(hwnd: HWND) {
     });
     if let Some((version, sha)) = job {
         balloon(hwnd, "Updating Marq", &format!("Downloading v{version}\u{2026}"), Balloon::None);
-        updater::install_async(hwnd, WM_APP_INSTALLED, version, sha);
+        updater::install_async(hwnd, WM_APP_UPDATER, version, sha);
     }
 }
 
-fn show_menu(hwnd: HWND) {
+fn show_menu(hwnd: HWND, anchor: (i32, i32)) {
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
         let add = |id: usize, text: &str, flags: MENU_ITEM_FLAGS| {
@@ -312,7 +320,7 @@ fn show_menu(hwnd: HWND) {
             let _ = SetMenuDefaultItem(menu, ID_UPDATE as u32, 0);
         }
 
-        let (x, y) = cursor_pos();
+        let (x, y) = anchor;
         let _ = SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(
             menu,
@@ -335,7 +343,7 @@ fn show_menu(hwnd: HWND) {
                 if APP.with(|a| a.borrow().update.is_some()) {
                     start_install(hwnd);
                 } else {
-                    updater::check_async(hwnd, WM_APP_CHECKED, true);
+                    updater::check_async(hwnd, WM_APP_UPDATER, true);
                 }
             }
             ID_OPEN_RELEASES => {
@@ -355,17 +363,77 @@ fn show_menu(hwnd: HWND) {
     }
 }
 
+fn on_checked(hwnd: HWND, manual: bool, res: CheckResult) {
+    match res {
+        CheckResult::Available { version, sha256 } => {
+            let first_time = APP.with(|a| {
+                let mut a = a.borrow_mut();
+                a.update = Some((version.clone(), sha256));
+                let first = a.notified_version.as_deref() != Some(version.as_str());
+                a.notified_version = Some(version.clone());
+                first
+            });
+            if manual {
+                start_install(hwnd);
+            } else if first_time {
+                balloon(
+                    hwnd,
+                    &format!("Marq v{version} is available"),
+                    "Click here to update, or use the tray menu.",
+                    Balloon::UpdateAvailable,
+                );
+            }
+        }
+        CheckResult::UpToDate => {
+            APP.with(|a| a.borrow_mut().update = None);
+            if manual {
+                balloon(
+                    hwnd,
+                    "You're up to date",
+                    &format!("Marq v{} is the latest version.", updater::CURRENT),
+                    Balloon::None,
+                );
+            }
+        }
+        CheckResult::Failed(e) => {
+            if manual {
+                balloon(hwnd, "Couldn't check for updates", &e, Balloon::None);
+            }
+        }
+    }
+}
+
+fn on_installed(hwnd: HWND, res: InstallResult) {
+    match res {
+        InstallResult::Ready(exe) => {
+            // Hand over to the new version; it waits for this process to exit.
+            if std::process::Command::new(&exe).arg("--updated").spawn().is_ok() {
+                unsafe {
+                    let _ = DestroyWindow(hwnd);
+                }
+            } else {
+                APP.with(|a| a.borrow_mut().updating = false);
+                balloon(hwnd, "Update installed", "Restart Marq to finish updating.", Balloon::None);
+            }
+        }
+        InstallResult::Failed(e) => {
+            APP.with(|a| a.borrow_mut().updating = false);
+            balloon(hwnd, "Update failed", &e, Balloon::None);
+        }
+    }
+}
+
 unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let taskbar_created = APP.with(|a| a.borrow().taskbar_created);
     if msg != 0 && msg == taskbar_created {
-        add_tray_icon(hwnd); // Explorer restarted.
+        let _ = add_tray_icon(hwnd); // Explorer restarted.
         return LRESULT(0);
     }
     match msg {
         WM_APP_TRAY => {
             match loword(lp.0 as usize) as u32 {
                 NIN_SELECT | NIN_KEYSELECT => snip_soon(hwnd, Mode::Region, 150),
-                WM_CONTEXTMENU => show_menu(hwnd),
+                WM_CONTEXTMENU => show_menu(hwnd, (loword(wp.0), hiword(wp.0))),
                 NIN_BALLOONUSERCLICK => {
                     if APP.with(|a| a.borrow().balloon == Balloon::UpdateAvailable) {
                         start_install(hwnd);
@@ -393,9 +461,14 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 TIMER_UPDATE_FIRST => {
                     let _ = KillTimer(Some(hwnd), TIMER_UPDATE_FIRST);
                     SetTimer(Some(hwnd), TIMER_UPDATE_PERIODIC, PERIODIC_CHECK_MS, None);
-                    updater::check_async(hwnd, WM_APP_CHECKED, false);
+                    updater::check_async(hwnd, WM_APP_UPDATER, false);
                 }
-                TIMER_UPDATE_PERIODIC => updater::check_async(hwnd, WM_APP_CHECKED, false),
+                TIMER_UPDATE_PERIODIC => updater::check_async(hwnd, WM_APP_UPDATER, false),
+                TIMER_TRAY_RETRY => {
+                    if add_tray_icon(hwnd) {
+                        let _ = KillTimer(Some(hwnd), TIMER_TRAY_RETRY);
+                    }
+                }
                 TIMER_TRIM => {
                     let _ = KillTimer(Some(hwnd), TIMER_TRIM);
                     trim_memory();
@@ -404,63 +477,11 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             LRESULT(0)
         }
-        WM_APP_CHECKED => {
-            let res = *Box::from_raw(lp.0 as *mut CheckResult);
-            let manual = wp.0 != 0;
-            match res {
-                CheckResult::Available { version, sha256 } => {
-                    let first_time = APP.with(|a| {
-                        let mut a = a.borrow_mut();
-                        a.update = Some((version.clone(), sha256));
-                        let first = a.notified_version.as_deref() != Some(version.as_str());
-                        a.notified_version = Some(version.clone());
-                        first
-                    });
-                    if manual {
-                        start_install(hwnd);
-                    } else if first_time {
-                        balloon(
-                            hwnd,
-                            &format!("Marq v{version} is available"),
-                            "Click here to update, or use the tray menu.",
-                            Balloon::UpdateAvailable,
-                        );
-                    }
-                }
-                CheckResult::UpToDate => {
-                    APP.with(|a| a.borrow_mut().update = None);
-                    if manual {
-                        balloon(
-                            hwnd,
-                            "You're up to date",
-                            &format!("Marq v{} is the latest version.", updater::CURRENT),
-                            Balloon::None,
-                        );
-                    }
-                }
-                CheckResult::Failed(e) => {
-                    if manual {
-                        balloon(hwnd, "Couldn't check for updates", &e, Balloon::None);
-                    }
-                }
-            }
-            LRESULT(0)
-        }
-        WM_APP_INSTALLED => {
-            let res = *Box::from_raw(lp.0 as *mut InstallResult);
-            match res {
-                InstallResult::Ready(exe) => {
-                    // Hand over to the new version; it waits for this process to exit.
-                    if std::process::Command::new(&exe).arg("--updated").spawn().is_ok() {
-                        let _ = DestroyWindow(hwnd);
-                    } else {
-                        APP.with(|a| a.borrow_mut().updating = false);
-                        balloon(hwnd, "Update installed", "Restart Marq to finish updating.", Balloon::None);
-                    }
-                }
-                InstallResult::Failed(e) => {
-                    APP.with(|a| a.borrow_mut().updating = false);
-                    balloon(hwnd, "Update failed", &e, Balloon::None);
+        WM_APP_UPDATER => {
+            for ev in updater::take_events() {
+                match ev {
+                    Event::Checked { manual, result } => on_checked(hwnd, manual, result),
+                    Event::Installed(result) => on_installed(hwnd, result),
                 }
             }
             LRESULT(0)

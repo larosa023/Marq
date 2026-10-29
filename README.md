@@ -13,15 +13,17 @@ A hyper-lightweight screen snipping tool for Windows. It lives in the system tra
 
 | Action | How |
 | --- | --- |
-| Start a snip | **Ctrl+Alt+S**, **PrtScn** (if Windows isn't using it), or click the tray icon |
+| Start a snip | **Ctrl+Alt+S** or click the tray icon |
 | Region | Drag a box |
 | Window | Press **W** (or click *Window*), then click a window |
 | Full screen | Press **S** (or click *Screen*), then click a monitor |
 | Cancel | **Esc** or right-click |
 
+**Want Print Screen to open Marq?** In Windows Settings → Accessibility → Keyboard, turn off *Use the Print screen key to open screen capture*, then restart Marq. (Marq leaves PrtScn alone while Windows is using it, so the two never open at once.)
+
 The snip is copied to the clipboard immediately. A preview card appears in the corner; click it to mark up.
 
-**Markup:** Pen (**P**), Highlighter (**H**), Arrow (**A**), colors **1–5**, Undo (**Ctrl+Z**). Every change is re-copied to the clipboard automatically.
+**Markup:** Pen (**P**), Highlighter (**H**), Arrow (**A**), colors **1–5**, Undo (**Ctrl+Z**), close (**Esc**). Your marked-up image is re-copied to the clipboard automatically a moment after each change, and again when you close the window.
 
 ## Updates
 
