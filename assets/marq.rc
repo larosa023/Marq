@@ -1,0 +1,4 @@
+#define RT_MANIFEST 24
+
+1 ICON "marq.ico"
+1 RT_MANIFEST "marq.manifest"
