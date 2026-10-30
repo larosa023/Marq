@@ -1,4 +1,5 @@
-//! "Start with Windows" via the per-user Run key (no admin needed).
+//! Saved settings: "Start with Windows" (per-user Run key, no admin needed) and the
+//! snip shortcut (HKCU\Software\Marq).
 
 use windows::Win32::System::Registry::*;
 
@@ -62,13 +63,12 @@ pub fn refresh_autostart_path() {
     }
 }
 
-/// True unless the user turned off Windows' "Use the Print screen key to open screen
-/// capture" (HKCU\Control Panel\Keyboard\PrintScreenKeyForSnippingEnabled = 0).
-/// On current Windows 11 builds it's on by default even when the value is absent.
-pub fn windows_uses_prtscn() -> bool {
-    let key = WStr::new("Control Panel\\Keyboard");
-    let name = WStr::new("PrintScreenKeyForSnippingEnabled");
-    let mut data: u32 = 1;
+const APP_KEY: &str = "Software\\Marq";
+
+fn read_dword(name: &str) -> Option<u32> {
+    let key = WStr::new(APP_KEY);
+    let name = WStr::new(name);
+    let mut data: u32 = 0;
     let mut size = std::mem::size_of::<u32>() as u32;
     let r = unsafe {
         RegGetValueW(
@@ -81,5 +81,45 @@ pub fn windows_uses_prtscn() -> bool {
             Some(&mut size),
         )
     };
-    !(r.is_ok() && data == 0)
+    if r.is_ok() { Some(data) } else { None }
+}
+
+fn write_dword(hkey: HKEY, name: &str, v: u32) {
+    let name = WStr::new(name);
+    unsafe {
+        let _ = RegSetValueExW(hkey, name.p(), Some(0), REG_DWORD, Some(&v.to_le_bytes()));
+    }
+}
+
+/// The snip shortcut as (modifier bits, virtual key). Defaults to Win+Shift+S.
+pub fn load_hotkey() -> (u32, u32) {
+    match (read_dword("HotkeyMods"), read_dword("HotkeyKey")) {
+        (Some(m), Some(k)) if k != 0 && crate::hotkey::problem(m, k).is_none() => (m, k),
+        _ => crate::hotkey::DEFAULT,
+    }
+}
+
+pub fn save_hotkey(mods: u32, vk: u32) {
+    let key = WStr::new(APP_KEY);
+    let mut hkey = HKEY::default();
+    let r = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            key.p(),
+            Some(0),
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_WRITE,
+            None,
+            &mut hkey,
+            None,
+        )
+    };
+    if r.is_ok() {
+        write_dword(hkey, "HotkeyMods", mods);
+        write_dword(hkey, "HotkeyKey", vk);
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+    }
 }

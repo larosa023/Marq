@@ -12,6 +12,7 @@ mod gfx;
 mod hotkey;
 mod overlay;
 mod settings;
+mod settings_ui;
 mod toast;
 mod updater;
 mod util;
@@ -36,13 +37,13 @@ const MUTEX_NAME: &str = "Local\\MarqSingleInstance-7f3a";
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_SNIP: u32 = WM_APP + 2; // from a second instance; wParam = mode
 const WM_APP_UPDATER: u32 = WM_APP + 3; // updater::take_events() has results
-const WM_APP_WIN_SHIFT_S: u32 = WM_APP + 4; // from the keyboard hook thread
+const WM_APP_SNIP_KEY: u32 = WM_APP + 4; // the snip shortcut was pressed (hook thread)
 
 // NIN_SELECT | NINF_KEY (not exported by the bindings).
 const NIN_KEYSELECT: u32 = NIN_SELECT | 0x1;
 
-const HK_REGION: i32 = 1;
-const HK_PRTSC: i32 = 2;
+/// Only used if the keyboard hook can't be installed (very rare).
+const HK_FALLBACK: i32 = 1;
 
 const TIMER_SNIP: usize = 1;
 const TIMER_UPDATE_FIRST: usize = 2;
@@ -55,7 +56,7 @@ const PERIODIC_CHECK_MS: u32 = 6 * 60 * 60 * 1000;
 const ID_REGION: usize = 100;
 const ID_WINDOW: usize = 101;
 const ID_SCREEN: usize = 102;
-const ID_AUTOSTART: usize = 110;
+const ID_SETTINGS: usize = 110;
 const ID_UPDATE: usize = 111;
 const ID_OPEN_RELEASES: usize = 112;
 const ID_QUIT: usize = 120;
@@ -129,6 +130,7 @@ fn main() {
         overlay::register();
         toast::register();
         editor::register();
+        settings_ui::register();
         register_class(&WStr::new(HOST_CLASS), Some(host_proc), IDC_ARROW, WNDCLASS_STYLES(0));
 
         let cls = WStr::new(HOST_CLASS);
@@ -190,36 +192,47 @@ fn main() {
     }
 }
 
-/// Win+Shift+S (via the keyboard hook), Ctrl+Alt+S as a backup, and Print Screen only
-/// when the user has turned off Windows' own "Print screen opens screen capture" setting.
+/// Install the one snip shortcut (saved in Settings; Win+Shift+S by default).
 fn register_hotkeys(hwnd: HWND) -> String {
-    unsafe {
-        let win_ok = hotkey::install(hwnd, WM_APP_WIN_SHIFT_S);
-        let ctrl_ok = RegisterHotKey(
-            Some(hwnd),
-            HK_REGION,
-            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-            VK_S.0 as u32,
-        )
-        .is_ok();
-        let prtsc_ok = !settings::windows_uses_prtscn()
-            && RegisterHotKey(Some(hwnd), HK_PRTSC, MOD_NOREPEAT, VK_SNAPSHOT.0 as u32).is_ok();
-        let mut keys: Vec<&str> = Vec::new();
-        if win_ok {
-            keys.push("Win+Shift+S");
-        }
-        if ctrl_ok {
-            keys.push("Ctrl+Alt+S");
-        }
-        if prtsc_ok {
-            keys.push("PrtScn");
-        }
-        if keys.is_empty() {
-            "the tray icon".into()
-        } else {
-            keys.join(" or ")
-        }
+    let (mods, vk) = settings::load_hotkey();
+    hotkey::set(mods, vk);
+    hotkey::install(hwnd, WM_APP_SNIP_KEY);
+    register_fallback(hwnd, mods, vk);
+    hotkey::label(mods, vk)
+}
+
+/// If the hook couldn't install, fall back to a normal hotkey (works for most combos
+/// that don't involve the Win key).
+fn register_fallback(hwnd: HWND, mods: u32, vk: u32) {
+    if hotkey::installed() {
+        return;
     }
+    unsafe {
+        let _ = UnregisterHotKey(Some(hwnd), HK_FALLBACK);
+        let mut m = MOD_NOREPEAT;
+        if mods & hotkey::M_WIN != 0 {
+            m |= MOD_WIN;
+        }
+        if mods & hotkey::M_SHIFT != 0 {
+            m |= MOD_SHIFT;
+        }
+        if mods & hotkey::M_CTRL != 0 {
+            m |= MOD_CONTROL;
+        }
+        if mods & hotkey::M_ALT != 0 {
+            m |= MOD_ALT;
+        }
+        let _ = RegisterHotKey(Some(hwnd), HK_FALLBACK, m, vk);
+    }
+}
+
+/// Called by the Settings window after the user picks a new shortcut.
+pub fn apply_hotkey(mods: u32, vk: u32) {
+    hotkey::set(mods, vk);
+    let hwnd = host();
+    register_fallback(hwnd, mods, vk);
+    APP.with(|a| a.borrow_mut().hotkey_label = hotkey::label(mods, vk));
+    update_tray_tip(hwnd);
 }
 
 fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
@@ -233,6 +246,20 @@ fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
     nid
 }
 
+fn tray_tip() -> String {
+    let hk = APP.with(|a| a.borrow().hotkey_label.clone());
+    format!("Marq \u{2014} {hk} to snip")
+}
+
+fn update_tray_tip(hwnd: HWND) {
+    unsafe {
+        let mut nid = tray_data(hwnd);
+        nid.uFlags = NIF_TIP | NIF_SHOWTIP;
+        fill_wide(&mut nid.szTip, &tray_tip());
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
 /// Add the tray icon. Returns false if Explorer wasn't ready (common right at login).
 fn add_tray_icon(hwnd: HWND) -> bool {
     unsafe {
@@ -241,8 +268,7 @@ fn add_tray_icon(hwnd: HWND) -> bool {
         nid.uCallbackMessage = WM_APP_TRAY;
         let dpi = dpi_for_window(hwnd);
         nid.hIcon = app_icon(GetSystemMetricsForDpi(SM_CXSMICON, dpi));
-        let hk = APP.with(|a| a.borrow().hotkey_label.clone());
-        fill_wide(&mut nid.szTip, &format!("Marq \u{2014} {} to snip", hk.split(" or ").next().unwrap_or("")));
+        fill_wide(&mut nid.szTip, &tray_tip());
         let ok = Shell_NotifyIconW(NIM_ADD, &nid).as_bool()
             // Already there (e.g. TaskbarCreated raced us): just refresh it.
             || Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
@@ -310,7 +336,7 @@ fn show_menu(hwnd: HWND, anchor: (i32, i32)) {
             let a = a.borrow();
             (a.hotkey_label.clone(), a.update.clone(), a.updating)
         });
-        let first_key = hk.split(" or ").next().unwrap_or("").to_string();
+        let first_key = hk.replace(" + ", "+");
 
         add(0, &format!("Marq v{}", updater::CURRENT), MF_STRING | MF_GRAYED);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -318,8 +344,7 @@ fn show_menu(hwnd: HWND, anchor: (i32, i32)) {
         add(ID_WINDOW, "Snip window", MF_STRING);
         add(ID_SCREEN, "Snip full screen", MF_STRING);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-        let auto = if settings::autostart_enabled() { MF_CHECKED } else { MF_UNCHECKED };
-        add(ID_AUTOSTART, "Start with Windows", MF_STRING | auto);
+        add(ID_SETTINGS, "Settings\u{2026}", MF_STRING);
         match (&update, updating) {
             (_, true) => add(ID_UPDATE, "Updating\u{2026}", MF_STRING | MF_GRAYED),
             (Some((v, _)), false) => add(ID_UPDATE, &format!("Update to v{v}"), MF_STRING),
@@ -350,7 +375,7 @@ fn show_menu(hwnd: HWND, anchor: (i32, i32)) {
             ID_REGION => snip_soon(hwnd, Mode::Region, 200),
             ID_WINDOW => snip_soon(hwnd, Mode::Window, 200),
             ID_SCREEN => snip_soon(hwnd, Mode::Screen, 200),
-            ID_AUTOSTART => settings::set_autostart(!settings::autostart_enabled()),
+            ID_SETTINGS => settings_ui::open(),
             ID_UPDATE => {
                 if APP.with(|a| a.borrow().update.is_some()) {
                     start_install(hwnd);
@@ -455,7 +480,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             LRESULT(0)
         }
-        WM_HOTKEY | WM_APP_WIN_SHIFT_S => {
+        WM_HOTKEY | WM_APP_SNIP_KEY => {
             overlay::start(Mode::Region);
             LRESULT(0)
         }
@@ -500,8 +525,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_DESTROY => {
             remove_tray_icon(hwnd);
-            let _ = UnregisterHotKey(Some(hwnd), HK_REGION);
-            let _ = UnregisterHotKey(Some(hwnd), HK_PRTSC);
+            let _ = UnregisterHotKey(Some(hwnd), HK_FALLBACK);
             PostQuitMessage(0);
             LRESULT(0)
         }

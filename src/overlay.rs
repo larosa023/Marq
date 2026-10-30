@@ -38,7 +38,7 @@ struct Overlay {
     cur: (i32, i32),
     hover: Option<RECT>,
     toolbar: RECT,
-    buttons: [RECT; 4],
+    buttons: [RECT; 5], // Region, Window, Screen, Settings, Close
     hot: Option<usize>,
     pressed: Option<usize>, // toolbar button under mouse-down
     armed: bool,            // window/screen click started on the overlay
@@ -109,7 +109,7 @@ pub fn start(mode: Mode) {
         cur: (cx - ox, cy - oy),
         hover: None,
         toolbar: RECT::default(),
-        buttons: [RECT::default(); 4],
+        buttons: [RECT::default(); 5],
         hot: None,
         pressed: None,
         armed: false,
@@ -149,7 +149,7 @@ pub fn start(mode: Mode) {
 }
 
 fn layout_toolbar(st: &mut Overlay, mon: RECT) {
-    let labels = ["Region", "Window", "Screen", ""];
+    let labels = ["Region", "Window", "Screen", "", ""];
     let dpi = st.dpi;
     let pad = sc(14, dpi);
     let gap = sc(4, dpi);
@@ -160,19 +160,19 @@ fn layout_toolbar(st: &mut Overlay, mon: RECT) {
         let ws = labels
             .iter()
             .enumerate()
-            .map(|(i, l)| if i == 3 { sc(32, dpi) } else { text_width(dc, l, st.font) + pad * 2 })
+            .map(|(i, l)| if i >= 3 { sc(32, dpi) } else { text_width(dc, l, st.font) + pad * 2 })
             .collect();
         ReleaseDC(None, dc);
         ws
     };
-    let total: i32 = widths.iter().sum::<i32>() + gap * 3 + inner * 2 + sc(8, dpi);
+    let total: i32 = widths.iter().sum::<i32>() + gap * 4 + inner * 2 + sc(8, dpi);
     let left = mon.left + (mon.right - mon.left - total) / 2;
     let top = mon.top + sc(18, dpi);
     st.toolbar = rect(left, top, left + total, top + h);
     let mut x = left + inner;
     for (i, w) in widths.iter().enumerate() {
         if i == 3 {
-            x += sc(8, dpi); // small separator before close
+            x += sc(8, dpi); // small separator before settings + close
         }
         st.buttons[i] = rect(x, top + inner, x + w, top + h - inner);
         x += w + gap;
@@ -478,14 +478,32 @@ fn compose(st: &Overlay, rc: RECT) {
                 let c = if i == active { argb(255, 255, 255, 255) } else { argb(255, 200, 200, 210) };
                 draw_text(back, labels[i], *b, st.font, c, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
-            // Close button: a drawn X (no font dependency).
+            // Settings gear and close X: drawn shapes, no font dependency.
             if let Some(g) = Graphics::from_hdc(back) {
                 g.clip(rc.left, rc.top, w, h);
+                let icon = |i: usize| if st.hot == Some(i) { argb(255, 255, 255, 255) } else { argb(255, 200, 200, 210) };
+
                 let b = st.buttons[3];
                 let cx = (b.left + b.right) as f32 / 2.0;
                 let cy = (b.top + b.bottom) as f32 / 2.0;
+                let c = icon(3);
+                let ring = scf(4.6, dpi);
+                g.stroke_ellipse(cx, cy, ring, scf(2.4, dpi), c);
+                for k in 0..8 {
+                    let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                    let (sx, sy) = (a.cos(), a.sin());
+                    g.line(
+                        cx + sx * ring, cy + sy * ring,
+                        cx + sx * scf(7.4, dpi), cy + sy * scf(7.4, dpi),
+                        scf(2.6, dpi), c,
+                    );
+                }
+
+                let b = st.buttons[4];
+                let cx = (b.left + b.right) as f32 / 2.0;
+                let cy = (b.top + b.bottom) as f32 / 2.0;
                 let k = scf(5.0, dpi);
-                let c = if st.hot == Some(3) { argb(255, 255, 255, 255) } else { argb(255, 200, 200, 210) };
+                let c = icon(4);
                 g.line(cx - k, cy - k, cx + k, cy + k, scf(1.6, dpi), c);
                 g.line(cx - k, cy + k, cx + k, cy - k, scf(1.6, dpi), c);
             }
@@ -579,6 +597,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         0 => set_mode(hwnd, st, Mode::Region),
                         1 => set_mode(hwnd, st, Mode::Window),
                         2 => set_mode(hwnd, st, Mode::Screen),
+                        3 => {
+                            cancel(hwnd);
+                            crate::settings_ui::open();
+                        }
                         _ => cancel(hwnd),
                     }
                 }

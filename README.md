@@ -13,15 +13,16 @@ A hyper-lightweight screen snipping tool for Windows. It lives in the system tra
 
 | Action | How |
 | --- | --- |
-| Start a snip | **Win+Shift+S**, **Ctrl+Alt+S**, or click the tray icon |
+| Start a snip | **Win+Shift+S** (changeable), or click the tray icon |
 | Region | Drag a box |
 | Window | Press **W** (or click *Window*), then click a window |
 | Full screen | Press **S** (or click *Screen*), then click a monitor |
+| Settings | Click the **gear** in the snip toolbar, or right-click the tray icon → *Settings* |
 | Cancel | **Esc** or right-click |
 
-Marq takes over **Win+Shift+S** from Windows (the same way PowerToys remaps shortcuts), so it works whether or not Microsoft's Snipping Tool is installed. One limitation: while an app running as administrator is focused, Windows doesn't pass that shortcut to Marq, so use **Ctrl+Alt+S** or the tray icon there.
+**Changing the shortcut:** open Settings, click **Change**, and press the keys you want (for example Ctrl+Shift+S or PrtScn). Only that one shortcut is active; **Reset** puts it back to Win+Shift+S. Settings also has **Start with Windows**.
 
-**Want Print Screen to open Marq?** In Windows Settings → Accessibility → Keyboard, turn off *Use the Print screen key to open screen capture*, then restart Marq. (Marq leaves PrtScn alone while Windows is using it, so the two never open at once.)
+Marq takes over its shortcut before Windows sees it (the same way PowerToys remaps keys), so Win+Shift+S works whether or not Microsoft's Snipping Tool is installed. One limitation: while an app running as administrator is focused, Windows doesn't pass shortcuts to Marq; use the tray icon there.
 
 The snip is copied to the clipboard immediately. A preview card appears in the corner; click it to mark up.
 
