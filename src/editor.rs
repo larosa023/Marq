@@ -83,6 +83,8 @@ struct Editor {
     hot: Option<usize>,
     copied: bool,
     copy_pending: bool,
+    saved: Option<std::path::PathBuf>, // gallery file to keep in sync with the markup
+    save_dirty: bool,
 }
 
 impl Drop for Editor {
@@ -97,7 +99,7 @@ pub fn register() {
     register_class(&WStr::new(CLASS), Some(wndproc), IDC_ARROW, WNDCLASS_STYLES(0));
 }
 
-pub fn open(img: Image) {
+pub fn open(img: Image, saved: Option<std::path::PathBuf>) {
     let Some(base) = Dib::from_image(&img) else { return };
     let Some(committed) = Dib::from_image(&img) else { return };
     drop(img);
@@ -135,6 +137,8 @@ pub fn open(img: Image) {
         hot: None,
         copied: false,
         copy_pending: false,
+        saved,
+        save_dirty: false,
     });
 
     unsafe {
@@ -321,12 +325,27 @@ fn rebuild_committed(st: &mut Editor) {
     }
 }
 
+/// Update the Gallery copy with the current markup (in the background).
+fn save_now(st: &mut Editor) {
+    if !st.save_dirty {
+        return;
+    }
+    st.save_dirty = false;
+    if let Some(p) = &st.saved {
+        unsafe {
+            let _ = GdiFlush();
+        }
+        crate::gallery::save_async(st.committed.pixels_mut().to_vec(), st.committed.w, st.committed.h, p.clone());
+    }
+}
+
 fn copy_now(hwnd: HWND, st: &mut Editor) {
     st.copy_pending = false;
     unsafe {
         let _ = KillTimer(Some(hwnd), TIMER_COPY);
         let _ = GdiFlush();
     }
+    save_now(st);
     if copy_to_clipboard(hwnd, st.committed.pixels_mut(), st.committed.w, st.committed.h) {
         st.copied = true;
         unsafe {
@@ -379,6 +398,7 @@ fn committed_changed(hwnd: HWND, st: &mut Editor) {
     rebuild_display(st);
     invalidate(hwnd, st.view);
     st.copy_pending = true;
+    st.save_dirty = true;
     unsafe {
         SetTimer(Some(hwnd), TIMER_COPY, COPY_DELAY_MS, None);
     }
@@ -680,6 +700,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 copy_to_clipboard(crate::host(), st.committed.pixels_mut(), st.committed.w, st.committed.h);
                 st.copy_pending = false;
             }
+            save_now(st);
             LRESULT(0)
         }
         WM_NCDESTROY => {

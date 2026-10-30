@@ -24,7 +24,7 @@ A hyper-lightweight screen snipping tool for Windows. It lives in the system tra
 
 Marq takes over its shortcut before Windows sees it (the same way PowerToys remaps keys), so Win+Shift+S works whether or not Microsoft's Snipping Tool is installed. One limitation: while an app running as administrator is focused, Windows doesn't pass shortcuts to Marq; use the tray icon there.
 
-The snip is copied to the clipboard immediately. A preview card appears in the corner; click it to mark up.
+The snip is copied to the clipboard immediately and saved as a PNG to **Pictures › Screenshots**, the same folder Windows uses for screenshots, so every snip shows up in File Explorer's **Gallery** and the Photos app. A preview card appears in the corner; click it to mark up. Markup is saved back to that same file. You can turn saving off, or open the folder, in Settings; the tray menu also has *Open Screenshots folder*.
 
 **Markup:** Pen (**P**), Highlighter (**H**), Arrow (**A**), colors **1–5**, Undo (**Ctrl+Z**), close (**Esc**). Your marked-up image is re-copied to the clipboard automatically a moment after each change, and again when you close the window.
 

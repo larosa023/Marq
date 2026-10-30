@@ -91,6 +91,32 @@ fn write_dword(hkey: HKEY, name: &str, v: u32) {
     }
 }
 
+/// Save every snip to Pictures\Screenshots (shows in the Gallery). On by default.
+pub fn save_to_gallery() -> bool {
+    read_dword("SaveToGallery").map_or(true, |v| v != 0)
+}
+
+pub fn set_save_to_gallery(on: bool) {
+    if let Some(hkey) = open_app_key() {
+        write_dword(hkey, "SaveToGallery", on as u32);
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+    }
+}
+
+fn open_app_key() -> Option<HKEY> {
+    let key = WStr::new(APP_KEY);
+    let mut hkey = HKEY::default();
+    let r = unsafe {
+        RegCreateKeyExW(
+            HKEY_CURRENT_USER, key.p(), Some(0), None, REG_OPTION_NON_VOLATILE,
+            KEY_WRITE, None, &mut hkey, None,
+        )
+    };
+    if r.is_ok() { Some(hkey) } else { None }
+}
+
 /// The snip shortcut as (modifier bits, virtual key). Defaults to Win+Shift+S.
 pub fn load_hotkey() -> (u32, u32) {
     match (read_dword("HotkeyMods"), read_dword("HotkeyKey")) {

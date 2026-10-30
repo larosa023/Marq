@@ -21,6 +21,7 @@ thread_local! {
 
 struct Toast {
     copied: bool,
+    saved: Option<std::path::PathBuf>, // where the snip was saved, if it was
     img: Option<Image>, // handed to the editor on click
     thumb: Dib,         // pre-scaled once, so painting is a plain blit
     thumb_at: (i32, i32),
@@ -57,7 +58,7 @@ pub fn close_current() -> bool {
 }
 
 /// Show the card near the bottom-right of the monitor where the snip was taken.
-pub fn show(img: Image, near: RECT, copied: bool) {
+pub fn show(img: Image, near: RECT, copied: bool, saved: Option<std::path::PathBuf>) {
     close_current();
     let cx = (near.left + near.right) / 2;
     let cy = (near.top + near.bottom) / 2;
@@ -90,6 +91,7 @@ pub fn show(img: Image, near: RECT, copied: bool) {
 
     let st = Box::new(Toast {
         copied,
+        saved,
         img: Some(img),
         thumb,
         thumb_at: ((w - tw) / 2, pad),
@@ -161,7 +163,11 @@ fn paint(hwnd: HWND, st: &mut Toast) {
             );
             draw_text(
                 back.dc,
-                if st.copied { "Click to mark up \u{00B7} right-click to dismiss" } else { "Click to open it and copy again" },
+                match (st.copied, st.saved.is_some()) {
+                    (true, true) => "Saved to Screenshots \u{00B7} click to mark up",
+                    (true, false) => "Click to mark up \u{00B7} right-click to dismiss",
+                    (false, _) => "Click to open it and copy again",
+                },
                 rect(tx, row + sc(18, dpi), rc.right - sc(10, dpi), row + sc(36, dpi)),
                 st.font, argb(255, 160, 160, 172), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
             );
@@ -219,9 +225,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_LBUTTONUP => {
             let img = st.img.take();
+            let saved = st.saved.take();
             let _ = DestroyWindow(hwnd);
             if let Some(img) = img {
-                crate::editor::open(img);
+                crate::editor::open(img, saved);
             }
             LRESULT(0)
         }

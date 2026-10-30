@@ -25,7 +25,7 @@ const OK: u32 = argb(255, 0x34, 0xC7, 0x59);
 
 // Layout in 96-DPI units.
 const CW: i32 = 440;
-const CH: i32 = 236;
+const CH: i32 = 280;
 
 thread_local! {
     static CURRENT: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
@@ -36,6 +36,8 @@ enum Btn {
     Change,
     Reset,
     Autostart,
+    Gallery,
+    OpenFolder,
     Done,
 }
 
@@ -49,6 +51,7 @@ struct Settings {
     vk: u32,
     recording: bool,
     autostart: bool,
+    gallery: bool,
     note: Option<(String, u32)>,
     hot: Option<Btn>,
 }
@@ -87,6 +90,7 @@ pub fn open() {
         vk,
         recording: false,
         autostart: settings::autostart_enabled(),
+        gallery: settings::save_to_gallery(),
         note: None,
         hot: None,
     });
@@ -113,13 +117,15 @@ pub fn open() {
     }
 }
 
-fn buttons(dpi: u32) -> [(Btn, RECT); 4] {
+fn buttons(dpi: u32) -> [(Btn, RECT); 6] {
     let s = |v| sc(v, dpi);
     [
         (Btn::Change, rect(s(272), s(48), s(344), s(84))),
         (Btn::Reset, rect(s(352), s(48), s(416), s(84))),
-        (Btn::Autostart, rect(s(24), s(140), s(260), s(166))),
-        (Btn::Done, rect(s(336), s(188), s(416), s(220))),
+        (Btn::Autostart, rect(s(24), s(138), s(240), s(164))),
+        (Btn::Gallery, rect(s(24), s(178), s(290), s(204))),
+        (Btn::OpenFolder, rect(s(304), s(174), s(416), s(208))),
+        (Btn::Done, rect(s(336), s(232), s(416), s(264))),
     ]
 }
 
@@ -198,12 +204,12 @@ fn paint(hwnd: HWND, st: &mut Settings) {
                 let (x, y, w, h) = (r.left as f32, r.top as f32, rect_w(r) as f32, rect_h(r) as f32);
                 let hot = st.hot == Some(*b);
                 match b {
-                    Btn::Autostart => {
+                    Btn::Autostart | Btn::Gallery => {
                         // Toggle switch.
                         let tw = f(40.0);
                         let th = f(22.0);
                         let ty = y + (h - th) / 2.0;
-                        let on = st.autostart;
+                        let on = if *b == Btn::Gallery { st.gallery } else { st.autostart };
                         let track = if on { ACCENT } else if hot { argb(255, 80, 80, 90) } else { argb(255, 64, 64, 72) };
                         g.fill_round_rect(x, ty, tw, th, th / 2.0, track);
                         let knob_x = if on { x + tw - th / 2.0 } else { x + th / 2.0 };
@@ -242,10 +248,19 @@ fn paint(hwnd: HWND, st: &mut Settings) {
                     let lr = rect(r.left + s(52), r.top, r.right + s(120), r.bottom);
                     draw_text(back.dc, "Start with Windows", lr, st.font, TEXT, DT_LEFT | single);
                 }
+                Btn::Gallery => {
+                    let lr = rect(r.left + s(52), r.top, r.right, r.bottom);
+                    draw_text(back.dc, "Save snips to Gallery", lr, st.font, TEXT, DT_LEFT | single);
+                }
+                Btn::OpenFolder => draw_text(back.dc, "Open folder", *r, st.font, TEXT, DT_CENTER | single),
             }
         }
         let ver = format!("Marq v{}", crate::updater::CURRENT);
-        draw_text(back.dc, &ver, rect(s(24), s(188), s(300), s(220)), st.font_s, MUTED, DT_LEFT | single);
+        draw_text(back.dc, &ver, rect(s(24), s(232), s(300), s(264)), st.font_s, MUTED, DT_LEFT | single);
+        draw_text(
+            back.dc, "Pictures \u{203A} Screenshots",
+            rect(s(76), s(202), s(300), s(220)), st.font_s, MUTED, DT_LEFT | single,
+        );
 
         let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, Some(back.dc), 0, 0, SRCCOPY);
         let _ = EndPaint(hwnd, &ps);
@@ -303,6 +318,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     st.autostart = settings::autostart_enabled();
                     redraw(hwnd);
                 }
+                Some(Btn::Gallery) => {
+                    st.gallery = !st.gallery;
+                    settings::set_save_to_gallery(st.gallery);
+                    redraw(hwnd);
+                }
+                Some(Btn::OpenFolder) => crate::gallery::open_folder(),
                 Some(Btn::Done) => {
                     let _ = DestroyWindow(hwnd);
                 }

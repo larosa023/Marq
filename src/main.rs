@@ -8,6 +8,7 @@
 
 mod capture;
 mod editor;
+mod gallery;
 mod gfx;
 mod hotkey;
 mod overlay;
@@ -59,6 +60,7 @@ const ID_SCREEN: usize = 102;
 const ID_SETTINGS: usize = 110;
 const ID_UPDATE: usize = 111;
 const ID_OPEN_RELEASES: usize = 112;
+const ID_OPEN_FOLDER: usize = 113;
 const ID_QUIT: usize = 120;
 
 static HOST: AtomicIsize = AtomicIsize::new(0);
@@ -98,7 +100,12 @@ pub fn host() -> HWND {
 /// Called by the overlay with the finished snip.
 pub fn on_snip(img: Image, screen_rect: RECT) {
     let copied = copy_to_clipboard(host(), &img.px, img.w, img.h);
-    toast::show(img, screen_rect, copied);
+    // Also keep it in Pictures\Screenshots so it shows up in the Gallery.
+    let saved = if settings::save_to_gallery() { gallery::new_path() } else { None };
+    if let Some(p) = &saved {
+        gallery::save_async(img.px.clone(), img.w, img.h, p.clone());
+    }
+    toast::show(img, screen_rect, copied, saved);
 }
 
 fn main() {
@@ -350,6 +357,7 @@ fn show_menu(hwnd: HWND, anchor: (i32, i32)) {
             (Some((v, _)), false) => add(ID_UPDATE, &format!("Update to v{v}"), MF_STRING),
             (None, false) => add(ID_UPDATE, "Check for updates", MF_STRING),
         }
+        add(ID_OPEN_FOLDER, "Open Screenshots folder", MF_STRING);
         add(ID_OPEN_RELEASES, "What's new\u{2026}", MF_STRING);
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         add(ID_QUIT, "Quit", MF_STRING);
@@ -383,6 +391,7 @@ fn show_menu(hwnd: HWND, anchor: (i32, i32)) {
                     updater::check_async(hwnd, WM_APP_UPDATER, true);
                 }
             }
+            ID_OPEN_FOLDER => gallery::open_folder(),
             ID_OPEN_RELEASES => {
                 let url = WStr::new(&format!(
                     "https://github.com/{}/{}/releases",
