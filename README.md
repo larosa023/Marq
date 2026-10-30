@@ -13,11 +13,13 @@ A hyper-lightweight screen snipping tool for Windows. It lives in the system tra
 
 | Action | How |
 | --- | --- |
-| Start a snip | **Ctrl+Alt+S** or click the tray icon |
+| Start a snip | **Win+Shift+S**, **Ctrl+Alt+S**, or click the tray icon |
 | Region | Drag a box |
 | Window | Press **W** (or click *Window*), then click a window |
 | Full screen | Press **S** (or click *Screen*), then click a monitor |
 | Cancel | **Esc** or right-click |
+
+Marq takes over **Win+Shift+S** from Windows (the same way PowerToys remaps shortcuts), so it works whether or not Microsoft's Snipping Tool is installed. One limitation: while an app running as administrator is focused, Windows doesn't pass that shortcut to Marq, so use **Ctrl+Alt+S** or the tray icon there.
 
 **Want Print Screen to open Marq?** In Windows Settings → Accessibility → Keyboard, turn off *Use the Print screen key to open screen capture*, then restart Marq. (Marq leaves PrtScn alone while Windows is using it, so the two never open at once.)
 

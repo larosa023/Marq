@@ -9,6 +9,7 @@
 mod capture;
 mod editor;
 mod gfx;
+mod hotkey;
 mod overlay;
 mod settings;
 mod toast;
@@ -35,6 +36,7 @@ const MUTEX_NAME: &str = "Local\\MarqSingleInstance-7f3a";
 const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_SNIP: u32 = WM_APP + 2; // from a second instance; wParam = mode
 const WM_APP_UPDATER: u32 = WM_APP + 3; // updater::take_events() has results
+const WM_APP_WIN_SHIFT_S: u32 = WM_APP + 4; // from the keyboard hook thread
 
 // NIN_SELECT | NINF_KEY (not exported by the bindings).
 const NIN_KEYSELECT: u32 = NIN_SELECT | 0x1;
@@ -188,11 +190,12 @@ fn main() {
     }
 }
 
-/// Ctrl+Alt+S always. Print Screen too, but only when the user has turned off Windows'
-/// own "Use the Print screen key to open screen capture" (otherwise both would open).
+/// Win+Shift+S (via the keyboard hook), Ctrl+Alt+S as a backup, and Print Screen only
+/// when the user has turned off Windows' own "Print screen opens screen capture" setting.
 fn register_hotkeys(hwnd: HWND) -> String {
     unsafe {
-        let main_ok = RegisterHotKey(
+        let win_ok = hotkey::install(hwnd, WM_APP_WIN_SHIFT_S);
+        let ctrl_ok = RegisterHotKey(
             Some(hwnd),
             HK_REGION,
             MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
@@ -201,11 +204,20 @@ fn register_hotkeys(hwnd: HWND) -> String {
         .is_ok();
         let prtsc_ok = !settings::windows_uses_prtscn()
             && RegisterHotKey(Some(hwnd), HK_PRTSC, MOD_NOREPEAT, VK_SNAPSHOT.0 as u32).is_ok();
-        match (main_ok, prtsc_ok) {
-            (true, true) => "Ctrl+Alt+S or PrtScn".into(),
-            (true, false) => "Ctrl+Alt+S".into(),
-            (false, true) => "PrtScn".into(),
-            (false, false) => "the tray icon".into(),
+        let mut keys: Vec<&str> = Vec::new();
+        if win_ok {
+            keys.push("Win+Shift+S");
+        }
+        if ctrl_ok {
+            keys.push("Ctrl+Alt+S");
+        }
+        if prtsc_ok {
+            keys.push("PrtScn");
+        }
+        if keys.is_empty() {
+            "the tray icon".into()
+        } else {
+            keys.join(" or ")
         }
     }
 }
@@ -230,7 +242,7 @@ fn add_tray_icon(hwnd: HWND) -> bool {
         let dpi = dpi_for_window(hwnd);
         nid.hIcon = app_icon(GetSystemMetricsForDpi(SM_CXSMICON, dpi));
         let hk = APP.with(|a| a.borrow().hotkey_label.clone());
-        fill_wide(&mut nid.szTip, &format!("Marq \u{2014} {hk} to snip"));
+        fill_wide(&mut nid.szTip, &format!("Marq \u{2014} {} to snip", hk.split(" or ").next().unwrap_or("")));
         let ok = Shell_NotifyIconW(NIM_ADD, &nid).as_bool()
             // Already there (e.g. TaskbarCreated raced us): just refresh it.
             || Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
@@ -443,7 +455,7 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             }
             LRESULT(0)
         }
-        WM_HOTKEY => {
+        WM_HOTKEY | WM_APP_WIN_SHIFT_S => {
             overlay::start(Mode::Region);
             LRESULT(0)
         }
