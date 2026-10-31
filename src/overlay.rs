@@ -70,6 +70,10 @@ pub fn register() {
     register_class(&WStr::new(CLASS), Some(wndproc), IDC_CROSS, WNDCLASS_STYLES(0));
 }
 
+pub fn is_open() -> bool {
+    OPEN.with(|o| o.get())
+}
+
 /// Freeze the screen and open the overlay. Ignored if one is already open.
 pub fn start(mode: Mode) {
     if OPEN.with(|o| o.get()) {
@@ -234,23 +238,29 @@ impl Overlay {
         if !self.magnifier || !self.mode.drags() || pt_in(&self.toolbar, x, y) {
             return None;
         }
-        let (cell, n) = self.loupe_cell();
-        let size = cell * n;
-        let fw = size;
-        let fh = size + sc(24, self.dpi);
+        let (fw, fh) = self.loupe_size();
         let off = sc(22, self.dpi);
+        // Keep it on the monitor under the cursor (monitors can differ in size).
         let (w, h) = (self.frozen.dib.w, self.frozen.dib.h);
+        let mon = self.monitors.iter().copied().find(|m| pt_in(m, x, y)).unwrap_or(rect(0, 0, w, h));
         let mut lx = x + off;
-        if lx + fw > w {
+        if lx + fw > mon.right {
             lx = x - off - fw;
         }
         let mut ly = y + off;
-        if ly + fh > h {
+        if ly + fh > mon.bottom {
             ly = y - off - fh;
         }
-        let lx = lx.clamp(0, (w - fw).max(0));
-        let ly = ly.clamp(0, (h - fh).max(0));
+        let lx = lx.clamp(mon.left, (mon.right - fw).max(mon.left));
+        let ly = ly.clamp(mon.top, (mon.bottom - fh).max(mon.top));
         Some(rect(lx, ly, lx + fw, ly + fh))
+    }
+
+    /// Frame size: the zoomed grid plus a strip for coordinates; wide enough for the label.
+    fn loupe_size(&self) -> (i32, i32) {
+        let (cell, n) = self.loupe_cell();
+        let size = cell * n;
+        (size.max(sc(156, self.dpi)), size + sc(24, self.dpi))
     }
 
     fn clamp(&self, r: RECT) -> RECT {
@@ -583,6 +593,8 @@ fn compose(st: &Overlay, rc: RECT) {
 fn draw_loupe(st: &Overlay, lr: RECT, rc: RECT) {
     let (cell, n) = st.loupe_cell();
     let size = cell * n;
+    let (fw, _) = st.loupe_size();
+    let gx = lr.left + (fw - size) / 2; // grid is centered in the frame
     let (cx, cy) = st.cur;
     let (w, h) = (st.frozen.dib.w, st.frozen.dib.h);
     let half = n / 2;
@@ -603,7 +615,7 @@ fn draw_loupe(st: &Overlay, lr: RECT, rc: RECT) {
             let old = SetStretchBltMode(back, COLORONCOLOR); // crisp pixels, no smoothing
             let _ = StretchBlt(
                 back,
-                lr.left + (ix0 - sx0) * cell,
+                gx + (ix0 - sx0) * cell,
                 lr.top + (iy0 - sy0) * cell,
                 (ix1 - ix0) * cell,
                 (iy1 - iy0) * cell,
@@ -619,7 +631,7 @@ fn draw_loupe(st: &Overlay, lr: RECT, rc: RECT) {
         if let Some(g) = Graphics::from_hdc(back) {
             g.clip(rc.left, rc.top, rect_w(&rc), rect_h(&rc));
             // Center pixel marker: dark + light outline so it shows on any color.
-            let px = (lr.left + half * cell) as f32;
+            let px = (gx + half * cell) as f32;
             let py = (lr.top + half * cell) as f32;
             g.stroke_round_rect(px - 1.0, py - 1.0, cell as f32 + 2.0, cell as f32 + 2.0, 0.0, 1.0, argb(200, 0, 0, 0));
             g.stroke_round_rect(px, py, cell as f32, cell as f32, 0.0, 1.0, argb(255, 255, 255, 255));
@@ -634,7 +646,7 @@ fn draw_loupe(st: &Overlay, lr: RECT, rc: RECT) {
         } else {
             0
         };
-        let txt = format!("{}, {}   #{:06X}", cx + ox, cy + oy, color);
+        let txt = format!("{}, {}  #{:06X}", cx + ox, cy + oy, color);
         draw_text(
             back, &txt,
             rect(lr.left, lr.top + size, lr.right, lr.bottom),

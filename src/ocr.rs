@@ -9,7 +9,6 @@ use windows::Media::Ocr::OcrEngine;
 use windows::Storage::Streams::DataWriter;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::util::{Dib, Image};
@@ -29,14 +28,10 @@ pub fn take_results() -> Vec<Done> {
 pub fn recognize_async(img: Image, near: RECT, hwnd: HWND, msg: u32) {
     let h = hwnd.0 as isize;
     std::thread::spawn(move || {
-        let result = unsafe {
-            let init = CoInitializeEx(None, COINIT_MULTITHREADED).is_ok();
-            let r = recognize(&img);
-            if init {
-                CoUninitialize();
-            }
-            r
-        };
+        // No CoInitialize/CoUninitialize here on purpose: the windows crate caches WinRT
+        // factories for the life of the process and keeps the MTA alive itself. Tearing
+        // COM down after each snip would leave those cached pointers dangling.
+        let result = recognize(&img);
         if let Ok(mut v) = RESULTS.lock() {
             v.push(Done { result, near });
         }
@@ -48,26 +43,24 @@ pub fn recognize_async(img: Image, near: RECT, hwnd: HWND, msg: u32) {
 
 fn recognize(img: &Image) -> Result<String, String> {
     let engine = OcrEngine::TryCreateFromUserProfileLanguages()
-        .map_err(|_| "Text recognition isn't available on this PC.".to_string())?;
+        .map_err(|_| "No text-recognition language installed.\nAdd one in Settings \u{203A} Time & language.".to_string())?;
 
     // Screen text is small; OCR reads it far better enlarged. Stay within the engine's limit.
+    // Only enlarge small crops, and keep the result modest so big selections stay fast.
     let max = OcrEngine::MaxImageDimension().unwrap_or(2600) as i32;
+    let cap = max.min(4000);
     let longest = img.w.max(img.h);
-    let factor = if longest * 3 <= max {
-        3
-    } else if longest * 2 <= max {
-        2
-    } else {
-        1
-    };
-    let (w, h, px) = if factor > 1 || longest > max {
-        let (tw, th) = if longest > max {
-            let s = max as f32 / longest as f32;
-            (((img.w as f32 * s) as i32).max(1), ((img.h as f32 * s) as i32).max(1))
-        } else {
-            (img.w * factor, img.h * factor)
-        };
+    let area = img.w as i64 * img.h as i64;
+    let factor = [3, 2]
+        .into_iter()
+        .find(|&f| longest * f <= cap && area * (f * f) as i64 <= 8_000_000)
+        .unwrap_or(1);
+    let (w, h, px) = if longest > max {
+        let s = max as f32 / longest as f32;
+        let (tw, th) = (((img.w as f32 * s) as i32).max(1), ((img.h as f32 * s) as i32).max(1));
         scale(img, tw, th).ok_or_else(|| "Couldn't prepare the image.".to_string())?
+    } else if factor > 1 {
+        scale(img, img.w * factor, img.h * factor).unwrap_or_else(|| (img.w, img.h, img.px.clone()))
     } else {
         (img.w, img.h, img.px.clone())
     };

@@ -117,7 +117,7 @@ pub fn show_text(result: &Result<String, String>, near: RECT) {
     let dpi = dpi_for_point(cx, cy);
     let (copied, mut lines) = match result {
         Ok(t) => (true, t.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>()),
-        Err(e) => (false, vec![e.clone()]),
+        Err(e) => (false, e.lines().map(str::to_string).collect()),
     };
     let total = lines.len();
     lines.truncate(3);

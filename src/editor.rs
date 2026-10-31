@@ -120,6 +120,7 @@ struct Editor {
     entry: Option<TextEntry>,
     edit_font: HFONT,
     edit_brush: HBRUSH,
+    edit_brush_light: HBRUSH, // behind dark text colors, so black text stays readable
     tool: Tool,
     color: usize,
     dpi: u32,
@@ -141,6 +142,7 @@ impl Drop for Editor {
             let _ = DeleteObject(self.font.into());
             let _ = DeleteObject(self.edit_font.into());
             let _ = DeleteObject(self.edit_brush.into());
+            let _ = DeleteObject(self.edit_brush_light.into());
         }
     }
 }
@@ -183,6 +185,7 @@ pub fn open(img: Image, saved: Option<std::path::PathBuf>) {
         entry: None,
         edit_font: label_font(sc(TEXT_PX, dpi)),
         edit_brush: unsafe { CreateSolidBrush(rgb_from_argb(argb(255, 44, 44, 50))) },
+        edit_brush_light: unsafe { CreateSolidBrush(rgb_from_argb(argb(255, 236, 236, 240))) },
         tool: Tool::Pen,
         color: 0,
         dpi,
@@ -784,7 +787,7 @@ fn begin_text(hwnd: HWND, st: &mut Editor, x: i32, y: i32) {
             None,
             WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
             x,
-            y - sc(4, st.dpi),
+            y,
             w,
             h,
             Some(hwnd),
@@ -802,7 +805,7 @@ fn begin_text(hwnd: HWND, st: &mut Editor, x: i32, y: i32) {
     }
 }
 
-fn end_text(hwnd: HWND, st: &mut Editor, keep: bool) {
+fn end_text(hwnd: HWND, st: &mut Editor, keep: bool, refocus: bool) {
     let Some(entry) = st.entry.take() else { return };
     let text = unsafe {
         let n = GetWindowTextLengthW(entry.edit).max(0) as usize;
@@ -811,14 +814,21 @@ fn end_text(hwnd: HWND, st: &mut Editor, keep: bool) {
         String::from_utf16_lossy(&buf[..got])
     };
     unsafe {
+        // Only take focus back if the text box still had it. Otherwise (e.g. the user
+        // just pressed the snip shortcut) grabbing focus would re-activate this window
+        // and close the new snip overlay.
+        let had_focus = GetFocus() == entry.edit;
         let _ = DestroyWindow(entry.edit);
-        let _ = SetFocus(Some(hwnd));
+        if refocus && had_focus {
+            let _ = SetFocus(Some(hwnd));
+        }
     }
     if keep && !text.trim().is_empty() {
         let s = Stroke {
             tool: Tool::Text,
             color: entry.color,
-            width: stroke_width(Tool::Text, st.dpi) / st.scale,
+            // Same pixel size as the text box (sc() rounds the same way the box font does).
+            width: sc(TEXT_PX, st.dpi) as f32 / st.scale,
             pts: vec![entry.at],
             text,
         };
@@ -869,7 +879,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_ERASEBKGND => LRESULT(1),
         WM_SIZE => {
-            end_text(hwnd, st, true);
+            end_text(hwnd, st, true, false);
             layout(hwnd, st);
             invalidate_all(hwnd);
             LRESULT(0)
@@ -883,7 +893,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             LRESULT(0)
         }
         WM_DPICHANGED => {
-            end_text(hwnd, st, true);
+            end_text(hwnd, st, true, false);
             st.dpi = (hiword(wp.0) as u32).max(96);
             let _ = DeleteObject(st.font.into());
             st.font = ui_font(sc(13, st.dpi), 500);
@@ -901,16 +911,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_CTLCOLOREDIT => {
             let hdc = HDC(wp.0 as *mut _);
             let color = st.entry.as_ref().map_or(COLORS[st.color], |e| e.color);
+            let (r, g, b) = ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
+            let dark = (r * 299 + g * 587 + b * 114) / 1000 < 0x60;
             SetTextColor(hdc, rgb_from_argb(color));
-            SetBkColor(hdc, rgb_from_argb(argb(255, 44, 44, 50)));
-            LRESULT(st.edit_brush.0 as isize)
+            if dark {
+                SetBkColor(hdc, rgb_from_argb(argb(255, 236, 236, 240)));
+                LRESULT(st.edit_brush_light.0 as isize)
+            } else {
+                SetBkColor(hdc, rgb_from_argb(argb(255, 44, 44, 50)));
+                LRESULT(st.edit_brush.0 as isize)
+            }
         }
         WM_APP_TEXT_DONE => {
-            end_text(hwnd, st, wp.0 != 0);
+            end_text(hwnd, st, wp.0 != 0, true);
             LRESULT(0)
         }
         WM_SETCURSOR => {
-            if loword(lp.0 as usize) as u32 == HTCLIENT {
+            // Over the text box: let it show its own I-beam.
+            if HWND(wp.0 as *mut _) == hwnd && loword(lp.0 as usize) as u32 == HTCLIENT {
                 let (x, y) = cursor_pos();
                 let mut p = POINT { x, y };
                 let _ = ScreenToClient(hwnd, &mut p);
@@ -929,7 +947,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_LBUTTONDOWN => {
             if st.entry.is_some() {
                 // First click away from a text box just places the text.
-                end_text(hwnd, st, true);
+                end_text(hwnd, st, true, true);
                 return LRESULT(0);
             }
             let (x, y) = lparam_point(lp);
@@ -1056,7 +1074,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_DESTROY => {
             // Closing right after a change: still put the final image on the clipboard.
-            end_text(hwnd, st, true);
+            end_text(hwnd, st, true, false);
             if st.current.is_some() {
                 finish_stroke(hwnd, st);
             }

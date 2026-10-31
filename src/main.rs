@@ -537,7 +537,10 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     Ok(_) => Err("Couldn't reach the clipboard.".to_string()),
                     Err(e) => Err(e),
                 };
-                toast::show_text(&result, done.near);
+                // Text is on the clipboard either way; don't cover a new snip with the card.
+                if !overlay::is_open() {
+                    toast::show_text(&result, done.near);
+                }
             }
             LRESULT(0)
         }
