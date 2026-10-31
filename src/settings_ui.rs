@@ -25,7 +25,7 @@ const OK: u32 = argb(255, 0x34, 0xC7, 0x59);
 
 // Layout in 96-DPI units.
 const CW: i32 = 440;
-const CH: i32 = 280;
+const CH: i32 = 318;
 
 thread_local! {
     static CURRENT: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
@@ -38,6 +38,7 @@ enum Btn {
     Autostart,
     Gallery,
     OpenFolder,
+    Magnifier,
     Done,
 }
 
@@ -52,6 +53,7 @@ struct Settings {
     recording: bool,
     autostart: bool,
     gallery: bool,
+    magnifier: bool,
     note: Option<(String, u32)>,
     hot: Option<Btn>,
 }
@@ -91,6 +93,7 @@ pub fn open() {
         recording: false,
         autostart: settings::autostart_enabled(),
         gallery: settings::save_to_gallery(),
+        magnifier: settings::magnifier(),
         note: None,
         hot: None,
     });
@@ -117,7 +120,7 @@ pub fn open() {
     }
 }
 
-fn buttons(dpi: u32) -> [(Btn, RECT); 6] {
+fn buttons(dpi: u32) -> [(Btn, RECT); 7] {
     let s = |v| sc(v, dpi);
     [
         (Btn::Change, rect(s(272), s(48), s(344), s(84))),
@@ -125,7 +128,8 @@ fn buttons(dpi: u32) -> [(Btn, RECT); 6] {
         (Btn::Autostart, rect(s(24), s(138), s(240), s(164))),
         (Btn::Gallery, rect(s(24), s(178), s(290), s(204))),
         (Btn::OpenFolder, rect(s(304), s(174), s(416), s(208))),
-        (Btn::Done, rect(s(336), s(232), s(416), s(264))),
+        (Btn::Magnifier, rect(s(24), s(226), s(290), s(252))),
+        (Btn::Done, rect(s(336), s(270), s(416), s(302))),
     ]
 }
 
@@ -204,12 +208,16 @@ fn paint(hwnd: HWND, st: &mut Settings) {
                 let (x, y, w, h) = (r.left as f32, r.top as f32, rect_w(r) as f32, rect_h(r) as f32);
                 let hot = st.hot == Some(*b);
                 match b {
-                    Btn::Autostart | Btn::Gallery => {
+                    Btn::Autostart | Btn::Gallery | Btn::Magnifier => {
                         // Toggle switch.
                         let tw = f(40.0);
                         let th = f(22.0);
                         let ty = y + (h - th) / 2.0;
-                        let on = if *b == Btn::Gallery { st.gallery } else { st.autostart };
+                        let on = match b {
+                            Btn::Gallery => st.gallery,
+                            Btn::Magnifier => st.magnifier,
+                            _ => st.autostart,
+                        };
                         let track = if on { ACCENT } else if hot { argb(255, 80, 80, 90) } else { argb(255, 64, 64, 72) };
                         g.fill_round_rect(x, ty, tw, th, th / 2.0, track);
                         let knob_x = if on { x + tw - th / 2.0 } else { x + th / 2.0 };
@@ -253,10 +261,14 @@ fn paint(hwnd: HWND, st: &mut Settings) {
                     draw_text(back.dc, "Save snips to Gallery", lr, st.font, TEXT, DT_LEFT | single);
                 }
                 Btn::OpenFolder => draw_text(back.dc, "Open folder", *r, st.font, TEXT, DT_CENTER | single),
+                Btn::Magnifier => {
+                    let lr = rect(r.left + s(52), r.top, r.right, r.bottom);
+                    draw_text(back.dc, "Magnifier while selecting", lr, st.font, TEXT, DT_LEFT | single);
+                }
             }
         }
         let ver = format!("Marq v{}", crate::updater::CURRENT);
-        draw_text(back.dc, &ver, rect(s(24), s(232), s(300), s(264)), st.font_s, MUTED, DT_LEFT | single);
+        draw_text(back.dc, &ver, rect(s(24), s(270), s(300), s(302)), st.font_s, MUTED, DT_LEFT | single);
         draw_text(
             back.dc, "Pictures \u{203A} Screenshots",
             rect(s(76), s(202), s(300), s(220)), st.font_s, MUTED, DT_LEFT | single,
@@ -324,6 +336,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     redraw(hwnd);
                 }
                 Some(Btn::OpenFolder) => crate::gallery::open_folder(),
+                Some(Btn::Magnifier) => {
+                    st.magnifier = !st.magnifier;
+                    settings::set_magnifier(st.magnifier);
+                    redraw(hwnd);
+                }
                 Some(Btn::Done) => {
                     let _ = DestroyWindow(hwnd);
                 }

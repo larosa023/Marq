@@ -17,6 +17,7 @@ A hyper-lightweight screen snipping tool for Windows. It lives in the system tra
 | Region | Drag a box |
 | Window | Press **W** (or click *Window*), then click a window |
 | Full screen | Press **S** (or click *Screen*), then click a monitor |
+| Copy text | Press **T** (or click *Text*), then drag over text; the text is copied instead of the picture |
 | Settings | Click the **gear** in the snip toolbar, or right-click the tray icon → *Settings* |
 | Cancel | **Esc** or right-click |
 
@@ -26,7 +27,11 @@ Marq takes over its shortcut before Windows sees it (the same way PowerToys rema
 
 The snip is copied to the clipboard immediately and saved as a PNG to **Pictures › Screenshots**, the same folder Windows uses for screenshots, so every snip shows up in File Explorer's **Gallery** and the Photos app. A preview card appears in the corner; click it to mark up. Markup is saved back to that same file. You can turn saving off, or open the folder, in Settings; the tray menu also has *Open Screenshots folder*.
 
-**Markup:** Pen (**P**), Highlighter (**H**), Arrow (**A**), colors **1–5**, Undo (**Ctrl+Z**), close (**Esc**). Your marked-up image is re-copied to the clipboard automatically a moment after each change, and again when you close the window.
+**Copy text:** Text mode reads the words in the area with Windows' built-in text recognition (on your PC, nothing is sent anywhere) and puts them on the clipboard. A card shows the first few lines.
+
+**Magnifier:** turn on *Magnifier while selecting* in Settings for a pixel-level zoom, coordinates and color next to the cursor, for lining up edges exactly.
+
+**Markup:** Pen (**P**), Marker (**H**), Arrow (**A**), Box (**R**), Text (**T**, click where it goes, type, press Enter), Blur (**B**, drag over anything private), Crop (**C**, drag the area to keep), colors **1–5**, Undo (**Ctrl+Z**, undoes crops too), close (**Esc**). Your marked-up image is re-copied to the clipboard automatically a moment after each change, and again when you close the window.
 
 ## Updates
 

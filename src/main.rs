@@ -11,6 +11,7 @@ mod editor;
 mod gallery;
 mod gfx;
 mod hotkey;
+mod ocr;
 mod overlay;
 mod settings;
 mod settings_ui;
@@ -39,6 +40,7 @@ const WM_APP_TRAY: u32 = WM_APP + 1;
 const WM_APP_SNIP: u32 = WM_APP + 2; // from a second instance; wParam = mode
 const WM_APP_UPDATER: u32 = WM_APP + 3; // updater::take_events() has results
 const WM_APP_SNIP_KEY: u32 = WM_APP + 4; // the snip shortcut was pressed (hook thread)
+const WM_APP_OCR: u32 = WM_APP + 5; // ocr::take_results() has results
 
 // NIN_SELECT | NINF_KEY (not exported by the bindings).
 const NIN_KEYSELECT: u32 = NIN_SELECT | 0x1;
@@ -106,6 +108,11 @@ pub fn on_snip(img: Image, screen_rect: RECT) {
         gallery::save_async(img.px.clone(), img.w, img.h, p.clone());
     }
     toast::show(img, screen_rect, copied, saved);
+}
+
+/// Called by the overlay in Text mode: read the text in the area, copy it.
+pub fn on_text(img: Image, screen_rect: RECT) {
+    ocr::recognize_async(img, screen_rect, host(), WM_APP_OCR);
 }
 
 fn main() {
@@ -520,6 +527,17 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                     trim_memory();
                 }
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_APP_OCR => {
+            for done in ocr::take_results() {
+                let result = match done.result {
+                    Ok(text) if copy_text_to_clipboard(hwnd, &text) => Ok(text),
+                    Ok(_) => Err("Couldn't reach the clipboard.".to_string()),
+                    Err(e) => Err(e),
+                };
+                toast::show_text(&result, done.near);
             }
             LRESULT(0)
         }

@@ -217,6 +217,41 @@ pub fn copy_to_clipboard(owner: HWND, px: &[u32], w: i32, h: i32) -> bool {
     }
 }
 
+/// Put plain text on the clipboard (CF_UNICODETEXT).
+pub fn copy_text_to_clipboard(owner: HWND, text: &str) -> bool {
+    let w: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let Ok(hmem) = GlobalAlloc(GMEM_MOVEABLE, w.len() * 2) else { return false };
+        let p = GlobalLock(hmem) as *mut u16;
+        if p.is_null() {
+            let _ = GlobalFree(Some(hmem));
+            return false;
+        }
+        std::ptr::copy_nonoverlapping(w.as_ptr(), p, w.len());
+        let _ = GlobalUnlock(hmem);
+        let mut opened = false;
+        for _ in 0..10 {
+            if OpenClipboard(Some(owner)).is_ok() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        if !opened {
+            let _ = GlobalFree(Some(hmem));
+            return false;
+        }
+        let _ = EmptyClipboard();
+        const CF_UNICODETEXT: u32 = 13;
+        let ok = SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hmem.0))).is_ok();
+        let _ = CloseClipboard();
+        if !ok {
+            let _ = GlobalFree(Some(hmem));
+        }
+        ok
+    }
+}
+
 // ---------------------------------------------------------------------------
 // DPI, fonts, text, window chrome
 // ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
-//! Small preview card shown after a snip: "Copied to clipboard — click to mark up".
+//! Small preview card shown after a snip ("Copied to clipboard — click to mark up"),
+//! or after copying text ("Text copied" plus the first few lines).
 
 use std::cell::Cell;
 
@@ -22,8 +23,9 @@ thread_local! {
 struct Toast {
     copied: bool,
     saved: Option<std::path::PathBuf>, // where the snip was saved, if it was
-    img: Option<Image>, // handed to the editor on click
-    thumb: Dib,         // pre-scaled once, so painting is a plain blit
+    img: Option<Image>,  // handed to the editor on click
+    thumb: Option<Dib>,  // pre-scaled once, so painting is a plain blit (None for text cards)
+    text: Vec<String>,   // text card: preview lines
     thumb_at: (i32, i32),
     back: Option<Dib>,
     dpi: u32,
@@ -93,7 +95,8 @@ pub fn show(img: Image, near: RECT, copied: bool, saved: Option<std::path::PathB
         copied,
         saved,
         img: Some(img),
-        thumb,
+        thumb: Some(thumb),
+        text: Vec::new(),
         thumb_at: ((w - tw) / 2, pad),
         back: Dib::new(w, h),
         dpi,
@@ -102,6 +105,46 @@ pub fn show(img: Image, near: RECT, copied: bool, saved: Option<std::path::PathB
         hot: false,
     });
 
+    create(st, x, y, w, h);
+}
+
+/// "Text copied" card with a short preview, or the reason nothing was copied.
+pub fn show_text(result: &Result<String, String>, near: RECT) {
+    close_current();
+    let cx = (near.left + near.right) / 2;
+    let cy = (near.top + near.bottom) / 2;
+    let work = work_area_for_point(cx, cy);
+    let dpi = dpi_for_point(cx, cy);
+    let (copied, mut lines) = match result {
+        Ok(t) => (true, t.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect::<Vec<_>>()),
+        Err(e) => (false, vec![e.clone()]),
+    };
+    let total = lines.len();
+    lines.truncate(3);
+    if copied && total > 3 {
+        lines.push(format!("+{} more line{}", total - 3, if total - 3 == 1 { "" } else { "s" }));
+    }
+    let w = sc(300, dpi);
+    let h = sc(14 + 22 + 6, dpi) + sc(18, dpi) * lines.len() as i32 + sc(12, dpi);
+    let x = work.right - w - sc(16, dpi);
+    let y = work.bottom - h - sc(16, dpi);
+    let st = Box::new(Toast {
+        copied,
+        saved: None,
+        img: None,
+        thumb: None,
+        text: lines,
+        thumb_at: (0, 0),
+        back: Dib::new(w, h),
+        dpi,
+        font_b: ui_font(sc(13, dpi), 600),
+        font: ui_font(sc(12, dpi), 400),
+        hot: false,
+    });
+    create(st, x, y, w, h);
+}
+
+fn create(st: Box<Toast>, x: i32, y: i32, w: i32, h: i32) {
     unsafe {
         let cls = WStr::new(CLASS);
         let title = WStr::new("Marq");
@@ -135,14 +178,39 @@ fn paint(hwnd: HWND, st: &mut Toast) {
         let hdc = BeginPaint(hwnd, &mut ps);
         let mut rc = RECT::default();
         let _ = GetClientRect(hwnd, &mut rc);
-        if let Some(back) = st.back.as_ref() {
+        if let (Some(back), None) = (st.back.as_ref(), st.thumb.as_ref()) {
+            // Text card.
+            let dpi = st.dpi;
+            let bg = if st.hot { argb(255, 44, 44, 50) } else { argb(255, 32, 32, 36) };
+            if let Some(g) = Graphics::from_hdc(back.dc) {
+                g.fill_round_rect(0.0, 0.0, rc.right as f32, rc.bottom as f32, 0.0, bg);
+                let dot = if st.copied { argb(255, 0x34, 0xC7, 0x59) } else { argb(255, 0xFF, 0x9F, 0x0A) };
+                g.fill_ellipse(scf(18.0, dpi), scf(25.0, dpi), scf(4.0, dpi), dot);
+            }
+            let tx = sc(30, dpi);
+            draw_text(
+                back.dc, if st.copied { "Text copied" } else { "Couldn't copy text" },
+                rect(tx, sc(14, dpi), rc.right - sc(12, dpi), sc(36, dpi)),
+                st.font_b, argb(255, 245, 245, 250), DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+            for (i, line) in st.text.iter().enumerate() {
+                let top = sc(42, dpi) + sc(18, dpi) * i as i32;
+                draw_text(
+                    back.dc, line,
+                    rect(tx, top, rc.right - sc(12, dpi), top + sc(18, dpi)),
+                    st.font, argb(255, 170, 170, 182),
+                    DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+            }
+            let _ = BitBlt(hdc, 0, 0, rc.right, rc.bottom, Some(back.dc), 0, 0, SRCCOPY);
+        } else if let (Some(back), Some(thumb)) = (st.back.as_ref(), st.thumb.as_ref()) {
             let bg = if st.hot { argb(255, 44, 44, 50) } else { argb(255, 32, 32, 36) };
             let (tx0, ty0) = st.thumb_at;
-            let (tw, th) = (st.thumb.w, st.thumb.h);
+            let (tw, th) = (thumb.w, thumb.h);
             if let Some(g) = Graphics::from_hdc(back.dc) {
                 g.fill_round_rect(0.0, 0.0, rc.right as f32, rc.bottom as f32, 0.0, bg);
             }
-            let _ = BitBlt(back.dc, tx0, ty0, tw, th, Some(st.thumb.dc), 0, 0, SRCCOPY);
+            let _ = BitBlt(back.dc, tx0, ty0, tw, th, Some(thumb.dc), 0, 0, SRCCOPY);
             let dpi = st.dpi;
             if let Some(g) = Graphics::from_hdc(back.dc) {
                 g.stroke_round_rect(

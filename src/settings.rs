@@ -117,6 +117,20 @@ fn open_app_key() -> Option<HKEY> {
     if r.is_ok() { Some(hkey) } else { None }
 }
 
+/// Show a pixel magnifier next to the cursor while selecting. Off by default.
+pub fn magnifier() -> bool {
+    read_dword("Magnifier").map_or(false, |v| v != 0)
+}
+
+pub fn set_magnifier(on: bool) {
+    if let Some(hkey) = open_app_key() {
+        write_dword(hkey, "Magnifier", on as u32);
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+    }
+}
+
 /// The snip shortcut as (modifier bits, virtual key). Defaults to Win+Shift+S.
 pub fn load_hotkey() -> (u32, u32) {
     match (read_dword("HotkeyMods"), read_dword("HotkeyKey")) {

@@ -12,6 +12,9 @@ sha2 = { version = "0.10", default-features = false }
 [dependencies.windows]
 version = "0.61"
 features = [
+    "Graphics_Imaging",
+    "Media_Ocr",
+    "Storage_Streams",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Graphics_GdiPlus",
