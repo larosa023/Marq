@@ -1,4 +1,4 @@
-//! Markup editor: pen, marker, arrow, box, text, blur and crop, five colors, undo.
+//! Markup editor: pen, marker, arrow, box, circle, text, blur and crop, five colors, undo.
 //! Every change re-copies the image to the clipboard (and the Gallery file) automatically.
 //!
 //! Smoothness: the image is pre-scaled once into a display buffer, the stroke in
@@ -45,16 +45,18 @@ enum Tool {
     Highlighter,
     Arrow,
     Rect,
+    Ellipse,
     Text,
     Blur,
     Crop,
 }
 
-const TOOLS: [(Tool, &str); 7] = [
+const TOOLS: [(Tool, &str); 8] = [
     (Tool::Pen, "Pen"),
     (Tool::Highlighter, "Marker"),
     (Tool::Arrow, "Arrow"),
     (Tool::Rect, "Box"),
+    (Tool::Ellipse, "Circle"),
     (Tool::Text, "Text"),
     (Tool::Blur, "Blur"),
     (Tool::Crop, "Crop"),
@@ -63,7 +65,7 @@ const TOOLS: [(Tool, &str); 7] = [
 impl Tool {
     /// Tools you drag corner-to-corner (or end-to-end).
     fn two_point(self) -> bool {
-        matches!(self, Tool::Arrow | Tool::Rect | Tool::Blur | Tool::Crop)
+        matches!(self, Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Blur | Tool::Crop)
     }
 }
 
@@ -240,7 +242,7 @@ pub fn open(img: Image, saved: Option<std::path::PathBuf>) {
 
 fn stroke_width(tool: Tool, dpi: u32) -> f32 {
     let base = match tool {
-        Tool::Pen | Tool::Rect => 4.0,
+        Tool::Pen | Tool::Rect | Tool::Ellipse => 4.0,
         Tool::Highlighter => 22.0,
         Tool::Arrow => 5.0,
         Tool::Text => TEXT_PX as f32,
@@ -277,6 +279,10 @@ fn draw_stroke(g: &Graphics, s: &Stroke) {
                 let (a, b) = (s.pts[0], s.pts[s.pts.len() - 1]);
                 g.arrow(a.0, a.1, b.0, b.1, s.width, s.color);
             }
+        }
+        Tool::Ellipse => {
+            let (x0, y0, x1, y1) = s.bounds();
+            g.stroke_ellipse_box(x0, y0, x1 - x0, y1 - y0, s.width, s.color);
         }
         Tool::Rect => {
             let (x0, y0, x1, y1) = s.bounds();
@@ -988,7 +994,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if st.current.is_some() {
                 let raw = to_image_space(st, x, y);
                 let two = st.current.as_ref().map_or(false, |s| s.tool.two_point());
-                let p = if two { clamp_to_image(st, raw) } else { raw };
+                let mut p = if two { clamp_to_image(st, raw) } else { raw };
+                // Hold Shift for a perfect circle / square.
+                let shape = st.current.as_ref().map_or(false, |s| matches!(s.tool, Tool::Rect | Tool::Ellipse));
+                if shape && GetKeyState(VK_SHIFT.0 as i32) < 0 {
+                    let o = st.current.as_ref().unwrap().pts[0];
+                    let (dx, dy) = (p.0 - o.0, p.1 - o.1);
+                    let side = dx.abs().max(dy.abs());
+                    p = clamp_to_image(st, (o.0 + side * dx.signum(), o.1 + side * dy.signum()));
+                }
                 let dirty = {
                     let s = st.current.as_mut().unwrap();
                     let last = *s.pts.last().unwrap();
@@ -1050,6 +1064,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 VK_H | VK_M if !ctrl => press(hwnd, st, tool(Tool::Highlighter)),
                 VK_A if !ctrl => press(hwnd, st, tool(Tool::Arrow)),
                 VK_R if !ctrl => press(hwnd, st, tool(Tool::Rect)),
+                VK_O if !ctrl => press(hwnd, st, tool(Tool::Ellipse)),
                 VK_T if !ctrl => press(hwnd, st, tool(Tool::Text)),
                 VK_B if !ctrl => press(hwnd, st, tool(Tool::Blur)),
                 VK_C if !ctrl => press(hwnd, st, tool(Tool::Crop)),

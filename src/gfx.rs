@@ -87,6 +87,15 @@ impl Graphics {
         }
     }
 
+    /// Ellipse outline filling the box (x, y, w, h); a square box gives a circle.
+    pub fn stroke_ellipse_box(&self, x: f32, y: f32, w: f32, h: f32, width: f32, color: u32) {
+        unsafe {
+            let pen = pen(color, width, false);
+            GdipDrawEllipse(self.0, pen, x, y, w, h);
+            GdipDeletePen(pen);
+        }
+    }
+
     pub fn stroke_ellipse(&self, cx: f32, cy: f32, r: f32, width: f32, color: u32) {
         unsafe {
             let pen = pen(color, width, false);

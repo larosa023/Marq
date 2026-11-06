@@ -31,7 +31,7 @@ The snip is copied to the clipboard immediately and saved as a PNG to **Pictures
 
 **Magnifier:** turn on *Magnifier while selecting* in Settings for a pixel-level zoom, coordinates and color next to the cursor, for lining up edges exactly.
 
-**Markup:** Pen (**P**), Marker (**H**), Arrow (**A**), Box (**R**), Text (**T**, click where it goes, type, press Enter), Blur (**B**, drag over anything private), Crop (**C**, drag the area to keep), colors **1–5**, Undo (**Ctrl+Z**, undoes crops too), close (**Esc**). Your marked-up image is re-copied to the clipboard automatically a moment after each change, and again when you close the window.
+**Markup:** Pen (**P**), Marker (**H**), Arrow (**A**), Box (**R**), Circle (**O**, stretch it into an oval; hold Shift for a perfect circle or square), Text (**T**, click where it goes, type, press Enter), Blur (**B**, drag over anything private), Crop (**C**, drag the area to keep), colors **1–5**, Undo (**Ctrl+Z**, undoes crops too), close (**Esc**). Your marked-up image is re-copied to the clipboard automatically a moment after each change, and again when you close the window.
 
 ## Updates
 
