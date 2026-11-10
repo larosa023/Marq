@@ -18,6 +18,7 @@ A hyper-lightweight screen snipping tool for Windows. It lives in the system tra
 | Window | Press **W** (or click *Window*), then click a window |
 | Full screen | Press **S** (or click *Screen*), then click a monitor |
 | Copy text | Press **T** (or click *Text*), then drag over text; the text is copied instead of the picture |
+| Scrolling capture | Press **L** (or click *Scroll*), drag the area, then scroll down; click **Done** (or press the snip shortcut) |
 | Settings | Click the **gear** in the snip toolbar, or right-click the tray icon → *Settings* |
 | Cancel | **Esc** or right-click |
 
@@ -31,7 +32,25 @@ The snip is copied to the clipboard immediately and saved as a PNG to **Pictures
 
 **Magnifier:** turn on *Magnifier while selecting* in Settings for a pixel-level zoom, coordinates and color next to the cursor, for lining up edges exactly.
 
-**Markup:** Pen (**P**), Marker (**H**), Arrow (**A**), Box (**R**), Circle (**O**, stretch it into an oval; hold Shift for a perfect circle or square), Text (**T**, click where it goes, type, press Enter), Blur (**B**, drag over anything private), Crop (**C**, drag the area to keep), colors **1–5**, Undo (**Ctrl+Z**, undoes crops too), close (**Esc**). Your marked-up image is re-copied to the clipboard automatically a moment after each change, and again when you close the window.
+**Scrolling capture:** pick the area that scrolls (a web page, a long spreadsheet), then scroll down at a normal pace. Marq keeps capturing and stitches the new part onto the bottom, building one tall image. A bar shows how tall it is; if you scroll too fast it asks you to scroll back up a little. Click **Done** and it's copied and saved like any snip.
+
+**Markup** (each tool has a key; hover a button for its name and tips):
+
+| Tool | Key | How |
+| --- | --- | --- |
+| Pen | **P** | Draw freely |
+| Marker | **H** | Highlight |
+| Arrow | **A** | Drag straight, or draw a curve and the arrow follows it; Shift = straight at 0/45/90° |
+| Box | **R** | Drag; Shift = square |
+| Circle | **O** | Drag; stretch for an oval, Shift = perfect circle |
+| Text | **T** | Click, type, press Enter |
+| Number | **N** | Click to drop 1, 2, 3… badges |
+| Measure | **M** | Draw along something of known length and type its real length (e.g. `20' 6"` or `5 m`); every line after that shows real lengths. Click Measure again to reset the scale |
+| Zoom | **Z** | Drag around a small detail, then click where the 2× magnified copy should go |
+| Blur | **B** | Drag over anything private |
+| Crop | **C** | Drag the area to keep |
+
+Colors **1–5**, thickness **[** and **]** (or the dot button), Undo **Ctrl+Z** (undoes crops too), close **Esc**. Your marked-up image is re-copied to the clipboard automatically a moment after each change, and again when you close the window.
 
 ## Updates
 

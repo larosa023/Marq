@@ -11,8 +11,10 @@ mod editor;
 mod gallery;
 mod gfx;
 mod hotkey;
+mod measure;
 mod ocr;
 mod overlay;
+mod scroll;
 mod settings;
 mod settings_ui;
 mod toast;
@@ -142,6 +144,7 @@ fn main() {
 
         gfx::startup();
         overlay::register();
+        scroll::register();
         toast::register();
         editor::register();
         settings_ui::register();
@@ -497,7 +500,12 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             LRESULT(0)
         }
         WM_HOTKEY | WM_APP_SNIP_KEY => {
-            overlay::start(Mode::Region);
+            // During a scrolling capture, the shortcut means "done".
+            if scroll::active() {
+                scroll::finish();
+            } else {
+                overlay::start(Mode::Region);
+            }
             LRESULT(0)
         }
         WM_APP_SNIP => {

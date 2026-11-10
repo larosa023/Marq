@@ -1,4 +1,5 @@
-//! Markup editor: pen, marker, arrow, box, circle, text, blur and crop, five colors, undo.
+//! Markup editor: pen, marker, arrow (straight or curved), box, circle, text, numbers,
+//! measure, zoom callout, blur and crop; five colors, three thicknesses, undo.
 //! Every change re-copies the image to the clipboard (and the Gallery file) automatically.
 //!
 //! Smoothness: the image is pre-scaled once into a display buffer, the stroke in
@@ -12,7 +13,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::gfx::{argb, Graphics};
+use crate::gfx::{argb, dist, line_dist, simplify, Graphics};
+use crate::measure::{self, Scale};
 use crate::util::*;
 
 const CLASS: &str = "MarqEditor";
@@ -23,13 +25,19 @@ const COPY_DELAY_MS: u32 = 600;
 /// From the text box: wParam 1 = keep the text, 0 = discard it.
 const WM_APP_TEXT_DONE: u32 = WM_APP + 30;
 const EM_SETMARGINS: u32 = 0x00D3;
+const EM_SETCUEBANNER: u32 = 0x1501;
 const ACCENT: u32 = argb(255, 0x8B, 0x6F, 0xFF);
 const BG: u32 = argb(255, 24, 24, 27);
 const BAR: u32 = argb(255, 32, 32, 36);
+const MUTED: u32 = argb(255, 150, 150, 162);
 const BAR_H: i32 = 52;
 const MARGIN: i32 = 12;
-/// Text label size on screen, in 96-DPI pixels.
-const TEXT_PX: i32 = 22;
+/// Thin / medium / thick.
+const SIZE_MULT: [f32; 3] = [0.6, 1.0, 1.7];
+/// Text label size on screen per thickness, in 96-DPI pixels.
+const TEXT_PX: [i32; 3] = [16, 22, 32];
+/// How much bigger the zoom callout shows its detail.
+const ZOOM: f32 = 2.0;
 
 const COLORS: [u32; 5] = [
     argb(255, 0xFF, 0x3B, 0x30), // red
@@ -47,25 +55,40 @@ enum Tool {
     Rect,
     Ellipse,
     Text,
+    Number,
+    Measure,
+    Zoom,
     Blur,
     Crop,
 }
 
-const TOOLS: [(Tool, &str); 8] = [
-    (Tool::Pen, "Pen"),
-    (Tool::Highlighter, "Marker"),
-    (Tool::Arrow, "Arrow"),
-    (Tool::Rect, "Box"),
-    (Tool::Ellipse, "Circle"),
-    (Tool::Text, "Text"),
-    (Tool::Blur, "Blur"),
-    (Tool::Crop, "Crop"),
+/// Toolbar order, name, and shortcut key.
+const TOOLS: [(Tool, &str, char); 11] = [
+    (Tool::Pen, "Pen", 'P'),
+    (Tool::Highlighter, "Marker", 'H'),
+    (Tool::Arrow, "Arrow", 'A'),
+    (Tool::Rect, "Box", 'R'),
+    (Tool::Ellipse, "Circle", 'O'),
+    (Tool::Text, "Text", 'T'),
+    (Tool::Number, "Number", 'N'),
+    (Tool::Measure, "Measure", 'M'),
+    (Tool::Zoom, "Zoom", 'Z'),
+    (Tool::Blur, "Blur", 'B'),
+    (Tool::Crop, "Crop", 'C'),
 ];
 
 impl Tool {
     /// Tools you drag corner-to-corner (or end-to-end).
     fn two_point(self) -> bool {
-        matches!(self, Tool::Arrow | Tool::Rect | Tool::Ellipse | Tool::Blur | Tool::Crop)
+        matches!(self, Tool::Rect | Tool::Ellipse | Tool::Measure | Tool::Zoom | Tool::Blur | Tool::Crop)
+    }
+
+    fn name(self) -> &'static str {
+        TOOLS.iter().find(|t| t.0 == self).map_or("", |t| t.1)
+    }
+
+    fn key(self) -> char {
+        TOOLS.iter().find(|t| t.0 == self).map_or(' ', |t| t.2)
     }
 }
 
@@ -73,6 +96,7 @@ impl Tool {
 enum Btn {
     Tool(Tool),
     Color(usize),
+    Size,
     Undo,
     Copy,
 }
@@ -80,17 +104,18 @@ enum Btn {
 struct Stroke {
     tool: Tool,
     color: u32,
-    width: f32, // line width, text size or blur block size, in image pixels
+    width: f32, // line width, text size, badge radius or blur block size, in image pixels
     pts: Vec<(f32, f32)>,
-    text: String,
+    text: String, // text label, badge number, or measured length
 }
 
 impl Stroke {
-    /// How far ink can reach beyond the points (arrowheads are wider than the shaft).
+    /// How far ink can reach beyond the points.
     fn reach(&self) -> f32 {
         match self.tool {
-            Tool::Arrow => self.width * 3.5 + 2.0,
-            Tool::Blur | Tool::Crop => 3.0,
+            Tool::Arrow => self.width * 4.0 + 2.0,
+            Tool::Measure => self.width * 8.0 + 30.0, // end ticks + label
+            Tool::Blur | Tool::Crop | Tool::Zoom => 3.0,
             _ => self.width / 2.0 + 2.0,
         }
     }
@@ -103,11 +128,41 @@ impl Stroke {
     }
 }
 
+/// Image space → where it's drawn: p * k + (ox, oy).
+#[derive(Clone, Copy)]
+struct Map {
+    ox: f32,
+    oy: f32,
+    k: f32,
+}
+
+impl Map {
+    const IDENTITY: Map = Map { ox: 0.0, oy: 0.0, k: 1.0 };
+    fn p(&self, p: (f32, f32)) -> (f32, f32) {
+        (self.ox + p.0 * self.k, self.oy + p.1 * self.k)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    Label,
+    Scale, // typing the real length of the line just drawn
+}
+
 /// A text box being typed into.
 struct TextEntry {
     edit: HWND,
     at: (f32, f32), // image-space top-left
     color: u32,
+    purpose: Purpose,
+}
+
+/// A zoom callout whose detail has been picked and is now following the mouse.
+struct ZoomPlacing {
+    src: (f32, f32, f32, f32),
+    at: (f32, f32),
+    color: u32,
+    width: f32,
 }
 
 struct Editor {
@@ -120,11 +175,17 @@ struct Editor {
     current: Option<Stroke>,
     current_dirty: RECT,    // screen-space bounds the current stroke has painted
     entry: Option<TextEntry>,
+    pending_measure: Option<Stroke>, // waiting for its real length to be typed
+    zoom: Option<ZoomPlacing>,
+    cal: Option<Scale>,     // drawing scale for Measure
+    recalibrate: bool,      // next Measure line sets a new scale
+    note: Option<String>,   // one-off message in the toolbar
     edit_font: HFONT,
     edit_brush: HBRUSH,
     edit_brush_light: HBRUSH, // behind dark text colors, so black text stays readable
     tool: Tool,
     color: usize,
+    size: usize,
     dpi: u32,
     font: HFONT,
     view: RECT,
@@ -172,7 +233,8 @@ pub fn open(img: Image, saved: Option<std::path::PathBuf>) {
     let s = ((max_w - margin * 2) as f32 / base.w as f32)
         .min((max_h - bar - margin * 2) as f32 / base.h as f32)
         .clamp(0.05, 1.0);
-    let cw = ((base.w as f32 * s) as i32 + margin * 2).max(bar_w);
+    // Leave room for the hint text after the buttons when the image is small.
+    let cw = ((base.w as f32 * s) as i32 + margin * 2).max(bar_w + sc(220, dpi));
     let ch = ((base.h as f32 * s) as i32 + bar + margin * 2).max(sc(240, dpi));
 
     let st = Box::new(Editor {
@@ -185,11 +247,17 @@ pub fn open(img: Image, saved: Option<std::path::PathBuf>) {
         current: None,
         current_dirty: RECT::default(),
         entry: None,
-        edit_font: label_font(sc(TEXT_PX, dpi)),
+        pending_measure: None,
+        zoom: None,
+        cal: None,
+        recalibrate: false,
+        note: None,
+        edit_font: font_px(sc(TEXT_PX[1], dpi), 600),
         edit_brush: unsafe { CreateSolidBrush(rgb_from_argb(argb(255, 44, 44, 50))) },
         edit_brush_light: unsafe { CreateSolidBrush(rgb_from_argb(argb(255, 236, 236, 240))) },
         tool: Tool::Pen,
         color: 0,
+        size: 1,
         dpi,
         font,
         view: RECT::default(),
@@ -240,68 +308,196 @@ pub fn open(img: Image, saved: Option<std::path::PathBuf>) {
     }
 }
 
-fn stroke_width(tool: Tool, dpi: u32) -> f32 {
-    let base = match tool {
+/// Screen-pixel size of a tool at 96 DPI, before thickness and zoom are applied.
+fn base_width(tool: Tool) -> f32 {
+    match tool {
         Tool::Pen | Tool::Rect | Tool::Ellipse => 4.0,
         Tool::Highlighter => 22.0,
         Tool::Arrow => 5.0,
-        Tool::Text => TEXT_PX as f32,
+        Tool::Measure => 2.5,
+        Tool::Number => 13.0, // badge radius
+        Tool::Text => TEXT_PX[1] as f32,
+        Tool::Zoom => 3.0,
         Tool::Blur => 12.0, // mosaic block size
         Tool::Crop => 1.5,
-    };
-    scf(base, dpi)
+    }
 }
 
-/// Bold, smoothly anti-aliased font for text labels (no ClearType color fringes,
-/// since labels are baked into the image).
-fn label_font(px: i32) -> HFONT {
+fn stroke_width(st: &Editor, tool: Tool) -> f32 {
+    let w = match tool {
+        Tool::Text => TEXT_PX[st.size] as f32,
+        Tool::Crop => base_width(tool),
+        _ => base_width(tool) * SIZE_MULT[st.size],
+    };
+    scf(w, st.dpi) / st.scale
+}
+
+/// Smoothly anti-aliased font (no ClearType color fringes, since text gets baked into
+/// the image).
+fn font_px(px: i32, weight: i32) -> HFONT {
     let face = WStr::new("Segoe UI");
     unsafe {
         CreateFontW(
-            -px.max(6), 0, 0, 0, 600, 0, 0, 0,
+            -px.max(6), 0, 0, 0, weight, 0, 0, 0,
             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
             ANTIALIASED_QUALITY, (DEFAULT_PITCH.0 | FF_SWISS.0) as u32, face.p(),
         )
     }
 }
 
-/// Draw shapes that GDI+ handles (pen, marker, arrow, box) — used for both the live
-/// preview and the final image.
-fn draw_stroke(g: &Graphics, s: &Stroke) {
+/// GDI text with a throwaway font of the given pixel size.
+fn gdi_text(dc: HDC, text: &str, r: RECT, px: f32, weight: i32, color: u32, flags: DRAW_TEXT_FORMAT) {
+    let font = font_px(px.round() as i32, weight);
+    unsafe {
+        let old = SelectObject(dc, font.into());
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, rgb_from_argb(color));
+        let mut w: Vec<u16> = text.encode_utf16().collect();
+        let mut rr = r;
+        DrawTextW(dc, &mut w, &mut rr, flags | DT_NOPREFIX);
+        SelectObject(dc, old);
+        let _ = DeleteObject(font.into());
+    }
+}
+
+fn text_size(dc: HDC, text: &str, px: f32, weight: i32) -> (i32, i32) {
+    let font = font_px(px.round() as i32, weight);
+    unsafe {
+        let old = SelectObject(dc, font.into());
+        let w: Vec<u16> = text.encode_utf16().collect();
+        let mut sz = SIZE::default();
+        let _ = GetTextExtentPoint32W(dc, &w, &mut sz);
+        SelectObject(dc, old);
+        let _ = DeleteObject(font.into());
+        (sz.cx, sz.cy)
+    }
+}
+
+/// Snap the end of a line to the nearest 45°.
+fn snap45(a: (f32, f32), b: (f32, f32)) -> (f32, f32) {
+    let (dx, dy) = (b.0 - a.0, b.1 - a.1);
+    let len = (dx * dx + dy * dy).sqrt();
+    let step = std::f32::consts::FRAC_PI_4;
+    let ang = (dy.atan2(dx) / step).round() * step;
+    (a.0 + len * ang.cos(), a.1 + len * ang.sin())
+}
+
+/// The points an arrow is drawn through: straight if the drag was nearly straight,
+/// otherwise a simplified version of the path (which then draws as a smooth curve).
+fn arrow_points(pts: &[(f32, f32)], width: f32) -> Vec<(f32, f32)> {
+    if pts.len() <= 2 {
+        return pts.to_vec();
+    }
+    let (a, b) = (pts[0], pts[pts.len() - 1]);
+    let bend = pts.iter().map(|&p| line_dist(p, a, b)).fold(0.0, f32::max);
+    if bend < width * 2.5 {
+        return vec![a, b];
+    }
+    let mut eps = width * 0.8;
+    let mut out = simplify(pts, eps);
+    while out.len() > 24 {
+        eps *= 1.5;
+        out = simplify(pts, eps);
+    }
+    out
+}
+
+/// Text on a badge: white, or near-black on light colors like yellow.
+fn ink_on(color: u32) -> u32 {
+    let (r, g, b) = ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
+    if (r * 299 + g * 587 + b * 114) / 1000 > 170 { argb(255, 20, 20, 20) } else { argb(255, 255, 255, 255) }
+}
+
+/// Draw a vector stroke (everything except blur, crop and zoom, which work on pixels).
+fn render(dc: HDC, s: &Stroke, m: Map) {
+    let w = s.width * m.k;
     match s.tool {
-        Tool::Pen => g.polyline(&s.pts, s.width, s.color, false),
-        Tool::Highlighter => {
-            let c = (s.color & 0x00FF_FFFF) | (0x70 << 24);
-            g.polyline(&s.pts, s.width, c, true)
-        }
-        Tool::Arrow => {
-            if s.pts.len() >= 2 {
-                let (a, b) = (s.pts[0], s.pts[s.pts.len() - 1]);
-                g.arrow(a.0, a.1, b.0, b.1, s.width, s.color);
+        Tool::Pen | Tool::Highlighter | Tool::Arrow | Tool::Rect | Tool::Ellipse => {
+            let Some(g) = Graphics::from_hdc(dc) else { return };
+            match s.tool {
+                Tool::Pen => {
+                    let pts: Vec<_> = s.pts.iter().map(|&p| m.p(p)).collect();
+                    g.polyline(&pts, w, s.color, false);
+                }
+                Tool::Highlighter => {
+                    let pts: Vec<_> = s.pts.iter().map(|&p| m.p(p)).collect();
+                    g.polyline(&pts, w, (s.color & 0x00FF_FFFF) | (0x70 << 24), true);
+                }
+                Tool::Arrow => {
+                    let pts: Vec<_> = arrow_points(&s.pts, s.width).iter().map(|&p| m.p(p)).collect();
+                    g.arrow_path(&pts, w, s.color);
+                }
+                Tool::Rect | Tool::Ellipse => {
+                    let (x0, y0, x1, y1) = s.bounds();
+                    let (a, b) = (m.p((x0, y0)), m.p((x1, y1)));
+                    if s.tool == Tool::Rect {
+                        g.stroke_round_rect(a.0, a.1, b.0 - a.0, b.1 - a.1, w * 0.6, w, s.color);
+                    } else {
+                        g.stroke_ellipse_box(a.0, a.1, b.0 - a.0, b.1 - a.1, w, s.color);
+                    }
+                }
+                _ => {}
             }
         }
-        Tool::Ellipse => {
-            let (x0, y0, x1, y1) = s.bounds();
-            g.stroke_ellipse_box(x0, y0, x1 - x0, y1 - y0, s.width, s.color);
+        Tool::Text => {
+            let (x, y) = m.p(s.pts[0]);
+            let r = rect(x.round() as i32, y.round() as i32, x as i32 + 20000, y as i32 + 20000);
+            gdi_text(dc, &s.text, r, w, 600, s.color, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOCLIP);
         }
-        Tool::Rect => {
-            let (x0, y0, x1, y1) = s.bounds();
-            g.stroke_round_rect(x0, y0, x1 - x0, y1 - y0, s.width * 0.6, s.width, s.color);
+        Tool::Number => {
+            let (cx, cy) = m.p(s.pts[0]);
+            if let Some(g) = Graphics::from_hdc(dc) {
+                g.fill_ellipse(cx, cy, w, s.color);
+                g.stroke_ellipse(cx, cy, w, (w * 0.12).max(1.0), argb(220, 255, 255, 255));
+            }
+            let r = rect((cx - w) as i32, (cy - w) as i32, (cx + w).ceil() as i32 + 1, (cy + w).ceil() as i32 + 1);
+            let px = if s.text.len() > 1 { w * 1.05 } else { w * 1.25 };
+            gdi_text(dc, &s.text, r, px, 700, ink_on(s.color), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
         }
-        Tool::Text | Tool::Blur | Tool::Crop => {}
+        Tool::Measure => render_measure(dc, s, m),
+        Tool::Zoom | Tool::Blur | Tool::Crop => {}
     }
+}
+
+/// Dimension line: the line, perpendicular end ticks, and the length in a small pill.
+fn render_measure(dc: HDC, s: &Stroke, m: Map) {
+    let (a, b) = (m.p(s.pts[0]), m.p(s.pts[s.pts.len() - 1]));
+    let w = (s.width * m.k).max(1.0);
+    let len = dist(a, b).max(1e-3);
+    let (ux, uy) = ((b.0 - a.0) / len, (b.1 - a.1) / len);
+    let (nx, ny) = (-uy, ux);
+    let tick = w * 4.0;
+    if let Some(g) = Graphics::from_hdc(dc) {
+        g.line(a.0, a.1, b.0, b.1, w, s.color);
+        for p in [a, b] {
+            g.line(p.0 - nx * tick, p.1 - ny * tick, p.0 + nx * tick, p.1 + ny * tick, w, s.color);
+        }
+    }
+    if s.text.is_empty() {
+        return;
+    }
+    let px = (w * 5.2).max(11.0);
+    let (tw, th) = text_size(dc, &s.text, px, 600);
+    let (mx, my) = ((a.0 + b.0) / 2.0, (a.1 + b.1) / 2.0);
+    let (pw, ph) = (tw as f32 + px * 0.9, th as f32 + px * 0.35);
+    let (lx, ly) = (mx - pw / 2.0, my - ph / 2.0);
+    if let Some(g) = Graphics::from_hdc(dc) {
+        g.fill_round_rect(lx, ly, pw, ph, ph / 2.0, argb(235, 24, 24, 28));
+        g.stroke_round_rect(lx, ly, pw, ph, ph / 2.0, (w * 0.5).max(1.0), s.color);
+    }
+    let r = rect(lx as i32, ly as i32, (lx + pw).ceil() as i32, (ly + ph).ceil() as i32);
+    gdi_text(dc, &s.text, r, px, 600, argb(255, 245, 245, 250), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
 }
 
 /// Apply a finished stroke to an image buffer.
 fn apply_stroke(dib: &Dib, s: &Stroke) {
     match s.tool {
         Tool::Blur => pixelate(dib, s),
-        Tool::Text => draw_label(dib, s),
-        _ => {
-            if let Some(g) = Graphics::from_hdc(dib.dc) {
-                draw_stroke(&g, s);
-            }
-        }
+        Tool::Zoom => apply_zoom(dib, s),
+        _ => render(dib.dc, s, Map::IDENTITY),
+    }
+    unsafe {
+        let _ = GdiFlush();
     }
 }
 
@@ -348,21 +544,102 @@ fn pixelate(dib: &Dib, s: &Stroke) {
     }
 }
 
-fn draw_label(dib: &Dib, s: &Stroke) {
-    let font = label_font(s.width.round() as i32);
-    let (x, y) = s.pts[0];
-    let r = rect(x.round() as i32, y.round() as i32, dib.w + 4000, dib.h + 4000);
+/// Where a zoom callout's magnified copy goes, in image space (kept inside the image).
+fn zoom_dest(src: (f32, f32, f32, f32), at: (f32, f32), img_w: f32, img_h: f32) -> (f32, f32, f32, f32) {
+    let (sw, sh) = ((src.2 - src.0).max(1.0), (src.3 - src.1).max(1.0));
+    let f = ZOOM.min(img_w * 0.95 / sw).min(img_h * 0.95 / sh).max(1.0);
+    let (dw, dh) = (sw * f, sh * f);
+    let x = (at.0 - dw / 2.0).clamp(0.0, (img_w - dw).max(0.0));
+    let y = (at.1 - dh / 2.0).clamp(0.0, (img_h - dh).max(0.0));
+    (x, y, x + dw, y + dh)
+}
+
+/// Callout outline and connector, mapped (shared by the preview and the final image).
+fn zoom_frame(dc: HDC, src: (f32, f32, f32, f32), dst: (f32, f32, f32, f32), color: u32, width: f32, m: Map) {
+    let (s0, s1) = (m.p((src.0, src.1)), m.p((src.2, src.3)));
+    let (d0, d1) = (m.p((dst.0, dst.1)), m.p((dst.2, dst.3)));
+    let w = width * m.k;
+    if let Some(g) = Graphics::from_hdc(dc) {
+        let sc_ = ((s0.0 + s1.0) / 2.0, (s0.1 + s1.1) / 2.0);
+        let dc_ = ((d0.0 + d1.0) / 2.0, (d0.1 + d1.1) / 2.0);
+        g.line(sc_.0, sc_.1, dc_.0, dc_.1, (w * 0.6).max(1.0), color);
+        g.stroke_round_rect(s0.0, s0.1, s1.0 - s0.0, s1.1 - s0.1, 0.0, (w * 0.6).max(1.0), color);
+    }
+}
+
+fn zoom_border(dc: HDC, dst: (f32, f32, f32, f32), color: u32, width: f32, m: Map) {
+    let (d0, d1) = (m.p((dst.0, dst.1)), m.p((dst.2, dst.3)));
+    if let Some(g) = Graphics::from_hdc(dc) {
+        g.stroke_round_rect(d0.0, d0.1, d1.0 - d0.0, d1.1 - d0.1, 0.0, (width * m.k).max(1.0), color);
+    }
+}
+
+fn apply_zoom(dib: &Dib, s: &Stroke) {
+    if s.pts.len() < 3 {
+        return;
+    }
+    let src = (s.pts[0].0, s.pts[0].1, s.pts[1].0, s.pts[1].1);
+    let dst = zoom_dest(src, s.pts[2], dib.w as f32, dib.h as f32);
     unsafe {
-        let old = SelectObject(dib.dc, font.into());
-        SetBkMode(dib.dc, TRANSPARENT);
-        SetTextColor(dib.dc, rgb_from_argb(s.color));
-        let mut w: Vec<u16> = s.text.encode_utf16().collect();
-        let mut rr = r;
-        DrawTextW(dib.dc, &mut w, &mut rr, DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX | DT_NOCLIP);
-        SelectObject(dib.dc, old);
-        let _ = DeleteObject(font.into());
         let _ = GdiFlush();
     }
+    // Copy the detail first: the connector line may cross it.
+    let r = rect(src.0.round() as i32, src.1.round() as i32, src.2.round() as i32, src.3.round() as i32);
+    let detail = crop(dib.pixels_mut(), dib.w, dib.h, r);
+    let Some(tmp) = Dib::from_image(&detail) else { return };
+    zoom_frame(dib.dc, src, dst, s.color, s.width, Map::IDENTITY);
+    unsafe {
+        SetStretchBltMode(dib.dc, HALFTONE);
+        let _ = SetBrushOrgEx(dib.dc, 0, 0, None);
+        let _ = StretchBlt(
+            dib.dc,
+            dst.0.round() as i32,
+            dst.1.round() as i32,
+            (dst.2 - dst.0).round() as i32,
+            (dst.3 - dst.1).round() as i32,
+            Some(tmp.dc),
+            0,
+            0,
+            tmp.w,
+            tmp.h,
+            SRCCOPY,
+        );
+    }
+    zoom_border(dib.dc, dst, s.color, s.width, Map::IDENTITY);
+}
+
+// ---------------------------------------------------------------------------
+// Toolbar
+// ---------------------------------------------------------------------------
+
+/// Toolbar buttons and the width they need.
+fn build_buttons(font: HFONT, dpi: u32) -> (Vec<(Btn, RECT)>, i32) {
+    let mut v = Vec::new();
+    let bar = sc(BAR_H, dpi);
+    let bh = sc(32, dpi);
+    let y = (bar - bh) / 2;
+    let mut x = sc(10, dpi);
+    let gap = sc(2, dpi);
+    let pad = sc(11, dpi);
+    let iw = sc(34, dpi);
+    for (t, _, _) in TOOLS {
+        v.push((Btn::Tool(t), rect(x, y, x + iw, y + bh)));
+        x += iw + gap;
+    }
+    x += sc(10, dpi);
+    for i in 0..COLORS.len() {
+        v.push((Btn::Color(i), rect(x, y, x + bh, y + bh)));
+        x += bh + gap;
+    }
+    v.push((Btn::Size, rect(x, y, x + bh, y + bh)));
+    x += bh + sc(10, dpi);
+    let undo_w = text_w(font, "Undo") + pad * 2;
+    v.push((Btn::Undo, rect(x, y, x + undo_w, y + bh)));
+    x += undo_w + gap;
+    let copy_w = text_w(font, "Copy").max(text_w(font, "Copied \u{2713}")) + pad * 2;
+    v.push((Btn::Copy, rect(x, y, x + copy_w, y + bh)));
+    x += copy_w + sc(10, dpi);
+    (v, x)
 }
 
 fn text_w(font: HFONT, t: &str) -> i32 {
@@ -374,33 +651,102 @@ fn text_w(font: HFONT, t: &str) -> i32 {
     }
 }
 
-/// Toolbar buttons and the width they need.
-fn build_buttons(font: HFONT, dpi: u32) -> (Vec<(Btn, RECT)>, i32) {
-    let mut v = Vec::new();
-    let bar = sc(BAR_H, dpi);
-    let bh = sc(32, dpi);
-    let y = (bar - bh) / 2;
-    let mut x = sc(10, dpi);
-    let gap = sc(3, dpi);
-    let pad = sc(11, dpi);
-    for (t, label) in TOOLS {
-        let w = text_w(font, label) + pad * 2;
-        v.push((Btn::Tool(t), rect(x, y, x + w, y + bh)));
-        x += w + gap;
+/// Little line-art icon for each tool, centered in its button.
+fn draw_icon(g: &Graphics, t: Tool, cx: f32, cy: f32, dpi: u32, c: u32) {
+    let u = |v: f32| scf(v, dpi);
+    let lw = u(1.7);
+    match t {
+        Tool::Pen => {
+            g.line(cx - u(6.0), cy + u(6.0), cx + u(5.0), cy - u(5.0), u(2.2), c);
+            g.fill_ellipse(cx - u(6.5), cy + u(6.5), u(1.4), c);
+        }
+        Tool::Highlighter => {
+            g.polyline(&[(cx - u(5.5), cy + u(3.5)), (cx + u(5.5), cy - u(3.5))], u(6.0), (c & 0x00FF_FFFF) | (0x99 << 24), true);
+        }
+        Tool::Arrow => g.arrow_path(
+            &[(cx - u(7.0), cy + u(5.0)), (cx - u(1.0), cy - u(5.0)), (cx + u(7.0), cy - u(4.0))],
+            u(1.8),
+            c,
+        ),
+        Tool::Rect => g.stroke_round_rect(cx - u(7.0), cy - u(5.5), u(14.0), u(11.0), u(1.5), lw, c),
+        Tool::Ellipse => g.stroke_ellipse_box(cx - u(7.5), cy - u(5.5), u(15.0), u(11.0), lw, c),
+        Tool::Text => {
+            g.line(cx - u(6.0), cy - u(6.0), cx + u(6.0), cy - u(6.0), u(2.2), c);
+            g.line(cx, cy - u(6.0), cx, cy + u(7.0), u(2.2), c);
+        }
+        Tool::Number => {
+            g.stroke_ellipse(cx, cy, u(7.5), lw, c);
+            g.line(cx + u(0.5), cy - u(4.0), cx + u(0.5), cy + u(4.0), lw, c);
+            g.line(cx + u(0.5), cy - u(4.0), cx - u(2.0), cy - u(1.8), lw, c);
+        }
+        Tool::Measure => {
+            g.stroke_round_rect(cx - u(8.5), cy - u(4.0), u(17.0), u(8.0), u(1.0), lw, c);
+            for (i, x) in [-5.0f32, -1.7, 1.7, 5.0].iter().enumerate() {
+                let len = if i % 2 == 0 { 3.5 } else { 2.0 };
+                g.line(cx + u(*x), cy - u(4.0), cx + u(*x), cy - u(4.0 - len), u(1.3), c);
+            }
+        }
+        Tool::Zoom => {
+            g.stroke_ellipse(cx - u(1.5), cy - u(1.5), u(5.5), lw, c);
+            g.line(cx + u(2.6), cy + u(2.6), cx + u(7.0), cy + u(7.0), u(2.4), c);
+            g.line(cx - u(4.0), cy - u(1.5), cx + u(1.0), cy - u(1.5), u(1.4), c);
+            g.line(cx - u(1.5), cy - u(4.0), cx - u(1.5), cy + u(1.0), u(1.4), c);
+        }
+        Tool::Blur => {
+            let cell = u(4.0);
+            for row in 0..3 {
+                for col in 0..3 {
+                    let a = [255u32, 110, 200, 140, 255, 90, 210, 120, 255][row * 3 + col];
+                    let color = (c & 0x00FF_FFFF) | (a << 24);
+                    let x = cx - u(6.5) + col as f32 * (cell + u(0.5));
+                    let y = cy - u(6.5) + row as f32 * (cell + u(0.5));
+                    g.fill_round_rect(x, y, cell, cell, u(0.8), color);
+                }
+            }
+        }
+        Tool::Crop => {
+            g.polyline(&[(cx - u(4.0), cy - u(8.0)), (cx - u(4.0), cy + u(4.0)), (cx + u(8.0), cy + u(4.0))], lw, c, false);
+            g.polyline(&[(cx - u(8.0), cy - u(4.0)), (cx + u(4.0), cy - u(4.0)), (cx + u(4.0), cy + u(8.0))], lw, c, false);
+        }
     }
-    x += sc(10, dpi);
-    for i in 0..COLORS.len() {
-        v.push((Btn::Color(i), rect(x, y, x + bh, y + bh)));
-        x += bh + gap;
+}
+
+/// What the toolbar's hint area says: the hovered button, or how to use the current tool.
+fn hint(st: &Editor) -> String {
+    if let Some(n) = &st.note {
+        return n.clone();
     }
-    x += sc(10, dpi);
-    let undo_w = text_w(font, "Undo") + pad * 2;
-    v.push((Btn::Undo, rect(x, y, x + undo_w, y + bh)));
-    x += undo_w + gap;
-    let copy_w = text_w(font, "Copy").max(text_w(font, "Copied \u{2713}")) + pad * 2;
-    v.push((Btn::Copy, rect(x, y, x + copy_w, y + bh)));
-    x += copy_w + sc(10, dpi);
-    (v, x)
+    if let Some((b, _)) = st.hot.and_then(|i| st.buttons.get(i)) {
+        return match b {
+            Btn::Tool(t) => format!("{} ({})", t.name(), t.key()),
+            Btn::Color(i) => format!("Color ({})", i + 1),
+            Btn::Size => format!("Thickness: {} ([ and ])", ["thin", "medium", "thick"][st.size]),
+            Btn::Undo => "Undo (Ctrl+Z)".into(),
+            Btn::Copy => "Copy again (Ctrl+C)".into(),
+        };
+    }
+    if st.zoom.is_some() {
+        return "Click where the zoomed copy goes \u{00B7} Esc cancels".into();
+    }
+    match st.tool {
+        Tool::Arrow => "Draw a curve to bend the arrow \u{00B7} Shift = straight".into(),
+        Tool::Rect => "Shift = perfect square".into(),
+        Tool::Ellipse => "Stretch for an oval \u{00B7} Shift = perfect circle".into(),
+        Tool::Text => "Click, type, press Enter".into(),
+        Tool::Number => format!("Click to place {}", count_numbers(st) + 1),
+        Tool::Measure if st.cal.is_none() || st.recalibrate => {
+            "Draw along a known length to set the scale".into()
+        }
+        Tool::Measure => "Shift = straight \u{00B7} click Measure again to reset the scale".into(),
+        Tool::Zoom => "Drag around a small detail to magnify it".into(),
+        Tool::Blur => "Drag over anything private".into(),
+        Tool::Crop => "Drag the area to keep".into(),
+        _ => String::new(),
+    }
+}
+
+fn count_numbers(st: &Editor) -> usize {
+    st.strokes.iter().filter(|s| s.tool == Tool::Number).count()
 }
 
 fn layout(hwnd: HWND, st: &mut Editor) {
@@ -465,16 +811,6 @@ fn rebuild_display(st: &mut Editor) {
     }
 }
 
-fn label(b: Btn, copied: bool) -> &'static str {
-    match b {
-        Btn::Tool(t) => TOOLS.iter().find(|(x, _)| *x == t).map(|(_, l)| *l).unwrap_or(""),
-        Btn::Undo => "Undo",
-        Btn::Copy if copied => "Copied \u{2713}",
-        Btn::Copy => "Copy",
-        Btn::Color(_) => "",
-    }
-}
-
 fn bar_rect(hwnd: HWND, st: &Editor) -> RECT {
     let mut rc = RECT::default();
     unsafe {
@@ -525,9 +861,7 @@ fn copy_now(hwnd: HWND, st: &mut Editor) {
         }
     }
     let r = bar_rect(hwnd, st);
-    unsafe {
-        let _ = InvalidateRect(Some(hwnd), Some(&r), false);
-    }
+    invalidate(hwnd, r);
 }
 
 fn to_image_space(st: &Editor, x: i32, y: i32) -> (f32, f32) {
@@ -539,6 +873,10 @@ fn to_image_space(st: &Editor, x: i32, y: i32) -> (f32, f32) {
 
 fn clamp_to_image(st: &Editor, p: (f32, f32)) -> (f32, f32) {
     (p.0.clamp(0.0, st.base.w as f32), p.1.clamp(0.0, st.base.h as f32))
+}
+
+fn view_map(st: &Editor) -> Map {
+    Map { ox: st.view.left as f32, oy: st.view.top as f32, k: st.scale }
 }
 
 /// Screen-space bounds of some image-space points, padded for ink width.
@@ -579,6 +917,7 @@ fn committed_changed(hwnd: HWND, st: &mut Editor) {
     }
     rebuild_display(st);
     invalidate(hwnd, st.view);
+    invalidate(hwnd, bar_rect(hwnd, st)); // e.g. "Click to place 3"
     st.copy_pending = true;
     st.save_dirty = true;
     unsafe {
@@ -586,8 +925,18 @@ fn committed_changed(hwnd: HWND, st: &mut Editor) {
     }
 }
 
+fn commit(hwnd: HWND, st: &mut Editor, s: Stroke) {
+    apply_stroke(&st.committed, &s);
+    st.strokes.push(s);
+    committed_changed(hwnd, st);
+}
+
+fn busy(st: &Editor) -> bool {
+    st.current.is_some() || st.entry.is_some() || st.zoom.is_some()
+}
+
 fn undo(hwnd: HWND, st: &mut Editor) {
-    if st.current.is_some() || st.entry.is_some() {
+    if busy(st) {
         return;
     }
     if st.strokes.pop().is_some() {
@@ -624,9 +973,17 @@ fn do_crop(hwnd: HWND, st: &mut Editor, s: &Stroke) {
 }
 
 fn press(hwnd: HWND, st: &mut Editor, b: Btn) {
+    st.note = None;
     match b {
-        Btn::Tool(t) => st.tool = t,
+        Btn::Tool(t) => {
+            // Clicking Measure while it's already selected sets a new scale.
+            if t == Tool::Measure && st.tool == Tool::Measure && st.cal.is_some() {
+                st.recalibrate = true;
+            }
+            st.tool = t;
+        }
         Btn::Color(i) => st.color = i,
+        Btn::Size => st.size = (st.size + 1) % 3,
         Btn::Undo => undo(hwnd, st),
         Btn::Copy => copy_now(hwnd, st),
     }
@@ -635,25 +992,65 @@ fn press(hwnd: HWND, st: &mut Editor, b: Btn) {
 }
 
 /// Live-only previews for tools whose result isn't a plain shape.
-fn draw_preview(g: &Graphics, st: &Editor, s: &Stroke) {
+fn draw_preview(dc: HDC, st: &Editor, s: &Stroke) {
+    let m = view_map(st);
     let (x0, y0, x1, y1) = s.bounds();
-    let px = 1.0 / st.scale; // one screen pixel, in image units
+    let (a, b) = (m.p((x0, y0)), m.p((x1, y1)));
     match s.tool {
-        Tool::Blur => {
-            g.fill_round_rect(x0, y0, x1 - x0, y1 - y0, 0.0, argb(70, 255, 255, 255));
-            g.stroke_round_rect(x0, y0, x1 - x0, y1 - y0, 0.0, 1.5 * px, argb(230, 255, 255, 255));
+        Tool::Blur | Tool::Zoom => {
+            if let Some(g) = Graphics::from_hdc(dc) {
+                g.fill_round_rect(a.0, a.1, b.0 - a.0, b.1 - a.1, 0.0, argb(60, 255, 255, 255));
+                g.stroke_round_rect(a.0, a.1, b.0 - a.0, b.1 - a.1, 0.0, 1.5, argb(230, 255, 255, 255));
+            }
         }
         Tool::Crop => {
-            let (w, h) = (st.base.w as f32, st.base.h as f32);
-            let shade = argb(150, 0, 0, 0);
-            g.fill_round_rect(0.0, 0.0, w, y0, 0.0, shade);
-            g.fill_round_rect(0.0, y1, w, h - y1, 0.0, shade);
-            g.fill_round_rect(0.0, y0, x0, y1 - y0, 0.0, shade);
-            g.fill_round_rect(x1, y0, w - x1, y1 - y0, 0.0, shade);
-            g.stroke_round_rect(x0, y0, x1 - x0, y1 - y0, 0.0, 1.5 * px, argb(255, 255, 255, 255));
+            let v = st.view;
+            let (l, t, r, btm) = (v.left as f32, v.top as f32, v.right as f32, v.bottom as f32);
+            if let Some(g) = Graphics::from_hdc(dc) {
+                let shade = argb(150, 0, 0, 0);
+                g.fill_round_rect(l, t, r - l, a.1 - t, 0.0, shade);
+                g.fill_round_rect(l, b.1, r - l, btm - b.1, 0.0, shade);
+                g.fill_round_rect(l, a.1, a.0 - l, b.1 - a.1, 0.0, shade);
+                g.fill_round_rect(b.0, a.1, r - b.0, b.1 - a.1, 0.0, shade);
+                g.stroke_round_rect(a.0, a.1, b.0 - a.0, b.1 - a.1, 0.0, 1.5, argb(255, 255, 255, 255));
+            }
         }
-        _ => draw_stroke(g, s),
+        Tool::Measure => {
+            let px = dist(s.pts[0], s.pts[s.pts.len() - 1]) as f64;
+            let cal = if st.recalibrate { None } else { st.cal };
+            let mut live = Stroke { tool: s.tool, color: s.color, width: s.width, pts: s.pts.clone(), text: String::new() };
+            live.text = measure::label(px, cal);
+            render(dc, &live, m);
+        }
+        _ => render(dc, s, m),
     }
+}
+
+/// The magnified copy following the mouse, before it's placed.
+fn draw_zoom_placing(dc: HDC, st: &Editor, z: &ZoomPlacing) {
+    let m = view_map(st);
+    let dst = zoom_dest(z.src, z.at, st.base.w as f32, st.base.h as f32);
+    zoom_frame(dc, z.src, dst, z.color, z.width, m);
+    let (d0, d1) = (m.p((dst.0, dst.1)), m.p((dst.2, dst.3)));
+    unsafe {
+        let _ = GdiFlush();
+        SetStretchBltMode(dc, HALFTONE);
+        let _ = SetBrushOrgEx(dc, 0, 0, None);
+        let _ = StretchBlt(
+            dc,
+            d0.0.round() as i32,
+            d0.1.round() as i32,
+            (d1.0 - d0.0).round() as i32,
+            (d1.1 - d0.1).round() as i32,
+            Some(st.committed.dc),
+            z.src.0.round() as i32,
+            z.src.1.round() as i32,
+            (z.src.2 - z.src.0).round().max(1.0) as i32,
+            (z.src.3 - z.src.1).round().max(1.0) as i32,
+            SRCCOPY,
+        );
+    }
+    zoom_border(dc, dst, z.color, z.width, m);
 }
 
 fn paint(hwnd: HWND, st: &mut Editor) {
@@ -681,13 +1078,13 @@ fn paint(hwnd: HWND, st: &mut Editor) {
                 g.fill_round_rect(0.0, 0.0, rect_w(&bar) as f32, rect_h(&bar) as f32, 0.0, BAR);
                 for (i, (b, r)) in st.buttons.iter().enumerate() {
                     let (x, y, w, h) = (r.left as f32, r.top as f32, rect_w(r) as f32, rect_h(r) as f32);
+                    let (cxp, cyp) = (x + w / 2.0, y + h / 2.0);
+                    let hot = st.hot == Some(i);
                     match b {
                         Btn::Color(ci) => {
-                            let cxp = x + w / 2.0;
-                            let cyp = y + h / 2.0;
                             if *ci == st.color {
                                 g.stroke_ellipse(cxp, cyp, w / 2.0 - 1.5, scf(2.0, dpi), argb(255, 255, 255, 255));
-                            } else if st.hot == Some(i) {
+                            } else if hot {
                                 g.stroke_ellipse(cxp, cyp, w / 2.0 - 1.5, scf(1.5, dpi), argb(90, 255, 255, 255));
                             }
                             g.fill_ellipse(cxp, cyp, w / 2.0 - scf(6.0, dpi), COLORS[*ci]);
@@ -695,11 +1092,26 @@ fn paint(hwnd: HWND, st: &mut Editor) {
                                 g.stroke_ellipse(cxp, cyp, w / 2.0 - scf(6.0, dpi), 1.0, argb(110, 255, 255, 255));
                             }
                         }
-                        _ => {
-                            let active = matches!(b, Btn::Tool(t) if *t == st.tool);
+                        Btn::Size => {
+                            if hot {
+                                g.fill_round_rect(x, y, w, h, h / 2.0, argb(36, 255, 255, 255));
+                            }
+                            let r = scf([2.5, 4.5, 7.0][st.size], dpi);
+                            g.fill_ellipse(cxp, cyp, r, argb(255, 225, 225, 232));
+                            g.stroke_ellipse(cxp, cyp, scf(9.0, dpi), 1.0, argb(70, 255, 255, 255));
+                        }
+                        Btn::Tool(t) => {
+                            let active = *t == st.tool;
                             if active {
-                                g.fill_round_rect(x, y, w, h, h / 2.0, ACCENT);
-                            } else if st.hot == Some(i) {
+                                g.fill_round_rect(x, y, w, h, scf(8.0, dpi), ACCENT);
+                            } else if hot {
+                                g.fill_round_rect(x, y, w, h, scf(8.0, dpi), argb(36, 255, 255, 255));
+                            }
+                            let c = if active { argb(255, 255, 255, 255) } else { argb(255, 205, 205, 215) };
+                            draw_icon(&g, *t, cxp, cyp, dpi, c);
+                        }
+                        Btn::Undo | Btn::Copy => {
+                            if hot {
                                 g.fill_round_rect(x, y, w, h, h / 2.0, argb(36, 255, 255, 255));
                             }
                         }
@@ -707,35 +1119,45 @@ fn paint(hwnd: HWND, st: &mut Editor) {
                 }
             }
             for (b, r) in st.buttons.iter() {
-                if let Btn::Color(_) = b {
-                    continue;
-                }
-                let active = matches!(b, Btn::Tool(t) if *t == st.tool);
-                let c = if active {
-                    argb(255, 255, 255, 255)
-                } else if *b == Btn::Copy && st.copied {
-                    argb(255, 0x34, 0xC7, 0x59)
-                } else {
-                    argb(255, 205, 205, 215)
+                let (text, c) = match b {
+                    Btn::Undo => ("Undo", argb(255, 205, 205, 215)),
+                    Btn::Copy if st.copied => ("Copied \u{2713}", argb(255, 0x34, 0xC7, 0x59)),
+                    Btn::Copy => ("Copy", argb(255, 205, 205, 215)),
+                    _ => continue,
                 };
-                draw_text(back.dc, label(*b, st.copied), *r, st.font, c, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                draw_text(back.dc, text, *r, st.font, c, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+            // Hint after the last button, if there's room.
+            let hint_left = st.bar_w;
+            if bar.right - sc(12, dpi) > hint_left + sc(40, dpi) {
+                let h = hint(st);
+                let color = if st.note.is_some() { argb(255, 0xFF, 0x9F, 0x0A) } else { MUTED };
+                draw_text(
+                    back.dc, &h, rect(hint_left, 0, bar.right - sc(12, dpi), bar.bottom),
+                    st.font, color, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
             }
         }
 
-        // Image (from the pre-scaled copy) and the stroke in progress.
+        // Image (from the pre-scaled copy) and anything in progress.
         if let Some(i) = intersect(rc, st.view) {
             let src = st.display.as_ref().unwrap_or(&st.committed);
             let _ = BitBlt(
                 back.dc, i.left, i.top, rect_w(&i), rect_h(&i),
                 Some(src.dc), i.left - st.view.left, i.top - st.view.top, SRCCOPY,
             );
+            let saved = SaveDC(back.dc);
+            let _ = IntersectClipRect(back.dc, i.left, i.top, i.right, i.bottom);
             if let Some(s) = &st.current {
-                if let Some(g) = Graphics::from_hdc(back.dc) {
-                    g.clip(i.left, i.top, rect_w(&i), rect_h(&i));
-                    g.set_transform(st.view.left as f32, st.view.top as f32, st.scale);
-                    draw_preview(&g, st, s);
-                }
+                draw_preview(back.dc, st, s);
             }
+            if let Some(s) = &st.pending_measure {
+                render(back.dc, s, view_map(st));
+            }
+            if let Some(z) = &st.zoom {
+                draw_zoom_placing(back.dc, st, z);
+            }
+            let _ = RestoreDC(back.dc, saved);
         }
 
         let _ = BitBlt(hdc, rc.left, rc.top, pw, ph, Some(back.dc), rc.left, rc.top, SRCCOPY);
@@ -744,50 +1166,91 @@ fn paint(hwnd: HWND, st: &mut Editor) {
 }
 
 fn finish_stroke(hwnd: HWND, st: &mut Editor) {
-    let Some(s) = st.current.take() else { return };
+    let Some(mut s) = st.current.take() else { return };
     unsafe {
         let _ = ReleaseCapture();
     }
     let dirty = st.current_dirty;
     st.current_dirty = RECT::default();
-    if s.tool.two_point() {
-        let (x0, y0, x1, y1) = s.bounds();
+    let discard = |hwnd: HWND, st: &Editor, crop_like: bool| {
+        invalidate(hwnd, if crop_like { st.view } else { dirty });
+    };
+    if s.tool.two_point() || s.tool == Tool::Arrow {
+        let (x0, y0, x1, y1) = if s.tool == Tool::Arrow {
+            s.pts.iter().fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |b, p| {
+                (b.0.min(p.0), b.1.min(p.1), b.2.max(p.0), b.3.max(p.1))
+            })
+        } else {
+            s.bounds()
+        };
         let (w, h) = ((x1 - x0) * st.scale, (y1 - y0) * st.scale);
         let too_small = match s.tool {
-            Tool::Arrow => (w * w + h * h).sqrt() < 6.0,
+            Tool::Arrow | Tool::Measure => (w * w + h * h).sqrt() < 6.0,
             _ => w < 4.0 || h < 4.0,
         };
         if too_small {
             // A click, not a drag: discard it.
-            if s.tool == Tool::Crop {
-                invalidate(hwnd, st.view);
-            } else {
-                invalidate(hwnd, dirty);
-            }
+            discard(hwnd, st, s.tool == Tool::Crop);
             return;
         }
     }
-    if s.tool == Tool::Crop {
-        do_crop(hwnd, st, &s);
-        return;
+    match s.tool {
+        Tool::Crop => do_crop(hwnd, st, &s),
+        Tool::Zoom => {
+            // Detail picked; now the magnified copy follows the mouse until a click.
+            let (x0, y0, x1, y1) = s.bounds();
+            st.zoom = Some(ZoomPlacing { src: (x0, y0, x1, y1), at: s.pts[1], color: s.color, width: s.width });
+            invalidate(hwnd, st.view);
+            invalidate(hwnd, bar_rect(hwnd, st));
+        }
+        Tool::Measure => {
+            let px = dist(s.pts[0], s.pts[1]) as f64;
+            if st.cal.is_none() || st.recalibrate {
+                begin_scale_entry(hwnd, st, s);
+            } else {
+                s.text = measure::label(px, st.cal);
+                commit(hwnd, st, s);
+            }
+        }
+        Tool::Arrow => {
+            s.pts = arrow_points(&s.pts, s.width);
+            invalidate(hwnd, dirty);
+            commit(hwnd, st, s);
+        }
+        _ => commit(hwnd, st, s),
     }
-    apply_stroke(&st.committed, &s);
-    st.strokes.push(s);
-    committed_changed(hwnd, st);
+}
+
+fn place_zoom(hwnd: HWND, st: &mut Editor) {
+    let Some(z) = st.zoom.take() else { return };
+    let s = Stroke {
+        tool: Tool::Zoom,
+        color: z.color,
+        width: z.width,
+        pts: vec![(z.src.0, z.src.1), (z.src.2, z.src.3), z.at],
+        text: String::new(),
+    };
+    commit(hwnd, st, s);
+    invalidate(hwnd, bar_rect(hwnd, st));
+}
+
+fn cancel_zoom(hwnd: HWND, st: &mut Editor) {
+    if st.zoom.take().is_some() {
+        invalidate(hwnd, st.view);
+        invalidate(hwnd, bar_rect(hwnd, st));
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Text labels: a small text box appears where you click; Enter (or clicking away)
-// places the text, Esc cancels.
+// Text boxes: for labels (click, type, Enter) and for the Measure scale (type the
+// real length of the line you just drew). Clicking away keeps what was typed;
+// Esc cancels.
 // ---------------------------------------------------------------------------
 
-fn begin_text(hwnd: HWND, st: &mut Editor, x: i32, y: i32) {
-    let at = clamp_to_image(st, to_image_space(st, x, y));
-    let h = sc(TEXT_PX, st.dpi) + sc(10, st.dpi);
-    let w = (st.view.right - x).max(sc(160, st.dpi));
+fn create_edit(hwnd: HWND, x: i32, y: i32, w: i32, h: i32, font: HFONT) -> Option<HWND> {
     let cls = WStr::new("EDIT");
     unsafe {
-        let Ok(edit) = CreateWindowExW(
+        let edit = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             cls.p(),
             None,
@@ -800,15 +1263,53 @@ fn begin_text(hwnd: HWND, st: &mut Editor, x: i32, y: i32) {
             None,
             Some(hinstance()),
             None,
-        ) else {
-            return;
-        };
-        SendMessageW(edit, WM_SETFONT, Some(WPARAM(st.edit_font.0 as usize)), Some(LPARAM(1)));
+        )
+        .ok()?;
+        SendMessageW(edit, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
         SendMessageW(edit, EM_SETMARGINS, Some(WPARAM(3)), Some(LPARAM(0))); // no inner margins
         let _ = SetWindowSubclass(edit, Some(edit_proc), 1, hwnd.0 as usize);
         let _ = SetFocus(Some(edit));
-        st.entry = Some(TextEntry { edit, at, color: COLORS[st.color] });
+        Some(edit)
     }
+}
+
+fn begin_text(hwnd: HWND, st: &mut Editor, x: i32, y: i32) {
+    let at = clamp_to_image(st, to_image_space(st, x, y));
+    let px = sc(TEXT_PX[st.size], st.dpi);
+    unsafe {
+        let _ = DeleteObject(st.edit_font.into());
+    }
+    st.edit_font = font_px(px, 600);
+    let h = px + sc(10, st.dpi);
+    let w = (st.view.right - x).max(sc(160, st.dpi));
+    if let Some(edit) = create_edit(hwnd, x, y, w, h, st.edit_font) {
+        st.entry = Some(TextEntry { edit, at, color: COLORS[st.color], purpose: Purpose::Label });
+    }
+}
+
+/// Ask for the real length of the measure line just drawn.
+fn begin_scale_entry(hwnd: HWND, st: &mut Editor, s: Stroke) {
+    let m = view_map(st);
+    let (a, b) = (m.p(s.pts[0]), m.p(s.pts[1]));
+    let (w, h) = (sc(210, st.dpi), sc(30, st.dpi));
+    let x = (((a.0 + b.0) / 2.0) as i32 - w / 2).clamp(st.view.left.min(st.view.right - w), (st.view.right - w).max(st.view.left));
+    let y = (((a.1 + b.1) / 2.0) as i32 + sc(14, st.dpi)).min(st.view.bottom - h).max(st.view.top);
+    let at = to_image_space(st, x, y);
+    let Some(edit) = create_edit(hwnd, x, y, w, h, st.font) else {
+        // No box: keep the line in pixels.
+        let mut s = s;
+        s.text = measure::label(dist(s.pts[0], s.pts[1]) as f64, None);
+        commit(hwnd, st, s);
+        return;
+    };
+    let cue = WStr::new("Real length, e.g. 20' 6\" or 5 m");
+    unsafe {
+        SendMessageW(edit, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(cue.0.as_ptr() as isize)));
+    }
+    st.pending_measure = Some(s);
+    st.entry = Some(TextEntry { edit, at, color: argb(255, 245, 245, 250), purpose: Purpose::Scale });
+    invalidate(hwnd, st.view);
+    invalidate(hwnd, bar_rect(hwnd, st));
 }
 
 fn end_text(hwnd: HWND, st: &mut Editor, keep: bool, refocus: bool) {
@@ -829,20 +1330,44 @@ fn end_text(hwnd: HWND, st: &mut Editor, keep: bool, refocus: bool) {
             let _ = SetFocus(Some(hwnd));
         }
     }
-    if keep && !text.trim().is_empty() {
-        let s = Stroke {
-            tool: Tool::Text,
-            color: entry.color,
-            // Same pixel size as the text box (sc() rounds the same way the box font does).
-            width: sc(TEXT_PX, st.dpi) as f32 / st.scale,
-            pts: vec![entry.at],
-            text,
-        };
-        apply_stroke(&st.committed, &s);
-        st.strokes.push(s);
-        committed_changed(hwnd, st);
+    match entry.purpose {
+        Purpose::Label => {
+            if keep && !text.trim().is_empty() {
+                let s = Stroke {
+                    tool: Tool::Text,
+                    color: entry.color,
+                    // Same pixel size as the text box.
+                    width: sc(TEXT_PX[st.size], st.dpi) as f32 / st.scale,
+                    pts: vec![entry.at],
+                    text,
+                };
+                commit(hwnd, st, s);
+            }
+        }
+        Purpose::Scale => {
+            if let Some(mut s) = st.pending_measure.take() {
+                let px = dist(s.pts[0], s.pts[1]) as f64;
+                let typed = if keep { measure::parse(&text) } else { None };
+                match typed {
+                    Some((value, units)) => {
+                        st.cal = Some(Scale { units, per_px: value / px.max(1e-6) });
+                        st.recalibrate = false;
+                        st.note = None;
+                        s.text = measure::format(value, units);
+                    }
+                    None => {
+                        if keep && !text.trim().is_empty() {
+                            st.note = Some("Couldn't read that length \u{2014} try 20' 6\" or 5 m".into());
+                        }
+                        s.text = measure::label(px, if st.recalibrate { None } else { st.cal });
+                    }
+                }
+                commit(hwnd, st, s);
+            }
+        }
     }
     invalidate(hwnd, st.view);
+    invalidate(hwnd, bar_rect(hwnd, st));
 }
 
 unsafe extern "system" fn edit_proc(
@@ -874,6 +1399,11 @@ unsafe extern "system" fn edit_proc(
     }
 }
 
+fn set_size(hwnd: HWND, st: &mut Editor, size: usize) {
+    st.size = size.min(2);
+    invalidate(hwnd, bar_rect(hwnd, st));
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let Some(st) = get_state::<Editor>(hwnd) else {
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -903,8 +1433,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             st.dpi = (hiword(wp.0) as u32).max(96);
             let _ = DeleteObject(st.font.into());
             st.font = ui_font(sc(13, st.dpi), 500);
-            let _ = DeleteObject(st.edit_font.into());
-            st.edit_font = label_font(sc(TEXT_PX, st.dpi));
             let r = &*(lp.0 as *const RECT);
             let _ = SetWindowPos(
                 hwnd, None, r.left, r.top, rect_w(r), rect_h(r),
@@ -939,7 +1467,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let mut p = POINT { x, y };
                 let _ = ScreenToClient(hwnd, &mut p);
                 let c = if pt_in(&st.view, p.x, p.y) {
-                    if st.tool == Tool::Text { IDC_IBEAM } else { IDC_CROSS }
+                    match st.tool {
+                        Tool::Text => IDC_IBEAM,
+                        _ if st.zoom.is_some() => IDC_HAND,
+                        _ => IDC_CROSS,
+                    }
                 } else if st.buttons.iter().any(|(_, r)| pt_in(r, p.x, p.y)) {
                     IDC_HAND
                 } else {
@@ -957,14 +1489,38 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return LRESULT(0);
             }
             let (x, y) = lparam_point(lp);
+            if st.zoom.is_some() {
+                if pt_in(&st.view, x, y) {
+                    place_zoom(hwnd, st);
+                } else {
+                    cancel_zoom(hwnd, st);
+                }
+                return LRESULT(0);
+            }
             if let Some((b, _)) = st.buttons.iter().copied().find(|(_, r)| pt_in(r, x, y)) {
                 press(hwnd, st, b);
                 return LRESULT(0);
             }
             if pt_in(&st.view, x, y) && st.current.is_none() {
-                if st.tool == Tool::Text {
-                    begin_text(hwnd, st, x, y);
-                    return LRESULT(0);
+                st.note = None;
+                match st.tool {
+                    Tool::Text => {
+                        begin_text(hwnd, st, x, y);
+                        return LRESULT(0);
+                    }
+                    Tool::Number => {
+                        let p = clamp_to_image(st, to_image_space(st, x, y));
+                        let s = Stroke {
+                            tool: Tool::Number,
+                            color: COLORS[st.color],
+                            width: stroke_width(st, Tool::Number),
+                            pts: vec![p],
+                            text: (count_numbers(st) + 1).to_string(),
+                        };
+                        commit(hwnd, st, s);
+                        return LRESULT(0);
+                    }
+                    _ => {}
                 }
                 let p = to_image_space(st, x, y);
                 let p = if st.tool.two_point() { clamp_to_image(st, p) } else { p };
@@ -972,7 +1528,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     tool: st.tool,
                     color: COLORS[st.color],
                     // Same thickness on screen no matter how far the view is zoomed out.
-                    width: stroke_width(st.tool, st.dpi) / st.scale,
+                    width: stroke_width(st, st.tool),
                     // Pen/marker start as a single point, so a click leaves a dot.
                     pts: if st.tool.two_point() { vec![p, p] } else { vec![p] },
                     text: String::new(),
@@ -991,56 +1547,80 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 st.hot = hot;
                 invalidate(hwnd, bar_rect(hwnd, st));
             }
-            if st.current.is_some() {
-                let raw = to_image_space(st, x, y);
-                let two = st.current.as_ref().map_or(false, |s| s.tool.two_point());
-                let mut p = if two { clamp_to_image(st, raw) } else { raw };
-                // Hold Shift for a perfect circle / square.
-                let shape = st.current.as_ref().map_or(false, |s| matches!(s.tool, Tool::Rect | Tool::Ellipse));
-                if shape && GetKeyState(VK_SHIFT.0 as i32) < 0 {
-                    let o = st.current.as_ref().unwrap().pts[0];
-                    let (dx, dy) = (p.0 - o.0, p.1 - o.1);
-                    let side = dx.abs().max(dy.abs());
-                    p = clamp_to_image(st, (o.0 + side * dx.signum(), o.1 + side * dy.signum()));
+            if st.zoom.is_some() {
+                let p = clamp_to_image(st, to_image_space(st, x, y));
+                if let Some(z) = st.zoom.as_mut() {
+                    z.at = p;
                 }
-                let dirty = {
-                    let s = st.current.as_mut().unwrap();
-                    let last = *s.pts.last().unwrap();
-                    if (last.0 - p.0).abs() < 0.5 && (last.1 - p.1).abs() < 0.5 {
-                        return LRESULT(0); // sub-pixel jitter
-                    }
-                    if two {
-                        let n = s.pts.len() - 1;
-                        s.pts[n] = p;
-                        None
-                    } else {
-                        s.pts.push(p);
-                        Some([last, p])
-                    }
-                };
-                let s = st.current.as_ref().unwrap();
-                let reach = s.reach();
-                let r = if s.tool == Tool::Crop {
-                    st.view // the shading covers the whole image
-                } else {
-                    match dirty {
-                        // Free-hand: only the newest segment changed.
-                        Some(seg) => screen_bounds(st, &seg, reach),
-                        // Shapes: old and new outline.
-                        None => {
-                            let now = screen_bounds(st, &s.pts, reach);
-                            let r = union(st.current_dirty, now);
-                            st.current_dirty = now;
-                            r
-                        }
-                    }
-                };
-                invalidate(hwnd, r);
+                invalidate(hwnd, st.view);
+                return LRESULT(0);
             }
+            if st.current.is_none() {
+                return LRESULT(0);
+            }
+            let raw = to_image_space(st, x, y);
+            let tool = st.current.as_ref().map_or(Tool::Pen, |s| s.tool);
+            let two = tool.two_point();
+            let mut p = if two { clamp_to_image(st, raw) } else { raw };
+            let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+            let origin = st.current.as_ref().unwrap().pts[0];
+            if shift {
+                match tool {
+                    // Perfect circle / square.
+                    Tool::Rect | Tool::Ellipse => {
+                        let (dx, dy) = (p.0 - origin.0, p.1 - origin.1);
+                        let side = dx.abs().max(dy.abs());
+                        p = clamp_to_image(st, (origin.0 + side * dx.signum(), origin.1 + side * dy.signum()));
+                    }
+                    // Straight, at 0/45/90°.
+                    Tool::Measure | Tool::Arrow => p = clamp_to_image(st, snap45(origin, p)),
+                    _ => {}
+                }
+            }
+            let dirty = {
+                let s = st.current.as_mut().unwrap();
+                let last = *s.pts.last().unwrap();
+                if (last.0 - p.0).abs() < 0.5 && (last.1 - p.1).abs() < 0.5 {
+                    return LRESULT(0); // sub-pixel jitter
+                }
+                if two {
+                    let n = s.pts.len() - 1;
+                    s.pts[n] = p;
+                    None
+                } else if tool == Tool::Arrow && shift {
+                    s.pts = vec![origin, p];
+                    None
+                } else {
+                    s.pts.push(p);
+                    if tool == Tool::Arrow { None } else { Some([last, p]) }
+                }
+            };
+            let s = st.current.as_ref().unwrap();
+            let reach = s.reach();
+            let r = if matches!(tool, Tool::Crop) {
+                st.view // the shading covers the whole image
+            } else {
+                match dirty {
+                    // Free-hand: only the newest segment changed.
+                    Some(seg) => screen_bounds(st, &seg, reach),
+                    // Shapes and arrows: old and new outline.
+                    None => {
+                        let now = screen_bounds(st, &s.pts, reach);
+                        let r = union(st.current_dirty, now);
+                        st.current_dirty = now;
+                        r
+                    }
+                }
+            };
+            invalidate(hwnd, r);
             LRESULT(0)
         }
         WM_LBUTTONUP => {
             finish_stroke(hwnd, st);
+            LRESULT(0)
+        }
+        WM_RBUTTONUP => {
+            cancel_zoom(hwnd, st);
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
@@ -1052,26 +1632,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_KEYDOWN => {
             let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
-            let tool = |t| Btn::Tool(t);
-            match VIRTUAL_KEY(wp.0 as u16) {
-                VK_ESCAPE => {
+            let key = VIRTUAL_KEY(wp.0 as u16);
+            if key == VK_ESCAPE {
+                if st.zoom.is_some() {
+                    cancel_zoom(hwnd, st);
+                } else if st.current.is_none() {
                     let _ = DestroyWindow(hwnd);
-                    return LRESULT(0);
                 }
-                VK_Z if ctrl => undo(hwnd, st),
-                VK_C if ctrl => copy_now(hwnd, st),
-                VK_P if !ctrl => press(hwnd, st, tool(Tool::Pen)),
-                VK_H | VK_M if !ctrl => press(hwnd, st, tool(Tool::Highlighter)),
-                VK_A if !ctrl => press(hwnd, st, tool(Tool::Arrow)),
-                VK_R if !ctrl => press(hwnd, st, tool(Tool::Rect)),
-                VK_O if !ctrl => press(hwnd, st, tool(Tool::Ellipse)),
-                VK_T if !ctrl => press(hwnd, st, tool(Tool::Text)),
-                VK_B if !ctrl => press(hwnd, st, tool(Tool::Blur)),
-                VK_C if !ctrl => press(hwnd, st, tool(Tool::Crop)),
-                k if !ctrl && (VK_1.0..=VK_5.0).contains(&k.0) => {
-                    press(hwnd, st, Btn::Color((k.0 - VK_1.0) as usize))
+                return LRESULT(0);
+            }
+            if ctrl {
+                match key {
+                    VK_Z => undo(hwnd, st),
+                    VK_C => copy_now(hwnd, st),
+                    _ => {}
                 }
-                _ => {}
+                return LRESULT(0);
+            }
+            if busy(st) {
+                return LRESULT(0);
+            }
+            match key {
+                k if (VK_1.0..=VK_5.0).contains(&k.0) => press(hwnd, st, Btn::Color((k.0 - VK_1.0) as usize)),
+                VK_OEM_4 => set_size(hwnd, st, st.size.saturating_sub(1)), // [
+                VK_OEM_6 => set_size(hwnd, st, st.size + 1),              // ]
+                k => {
+                    let c = char::from_u32(k.0 as u32).unwrap_or(' ');
+                    if let Some((t, _, _)) = TOOLS.iter().find(|t| t.2 == c) {
+                        press(hwnd, st, Btn::Tool(*t));
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -1090,6 +1680,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_DESTROY => {
             // Closing right after a change: still put the final image on the clipboard.
             end_text(hwnd, st, true, false);
+            st.zoom = None;
             if st.current.is_some() {
                 finish_stroke(hwnd, st);
             }

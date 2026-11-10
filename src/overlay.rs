@@ -17,13 +17,14 @@ pub enum Mode {
     Region,
     Window,
     Screen,
-    Text, // drag like Region, but copy the text inside instead of the picture
+    Text,   // drag like Region, but copy the text inside instead of the picture
+    Scroll, // drag an area, then scroll; the frames are stitched into one tall image
 }
 
 impl Mode {
     /// Modes where you drag out a box.
     fn drags(self) -> bool {
-        matches!(self, Mode::Region | Mode::Text)
+        matches!(self, Mode::Region | Mode::Text | Mode::Scroll)
     }
 }
 
@@ -46,7 +47,7 @@ struct Overlay {
     cur: (i32, i32),
     hover: Option<RECT>,
     toolbar: RECT,
-    buttons: [RECT; 6], // Region, Window, Screen, Text, Settings, Close
+    buttons: [RECT; 7], // Region, Window, Screen, Text, Scroll, Settings, Close
     hot: Option<usize>,
     pressed: Option<usize>, // toolbar button under mouse-down
     armed: bool,            // window/screen click started on the overlay
@@ -123,7 +124,7 @@ pub fn start(mode: Mode) {
         cur: (cx - ox, cy - oy),
         hover: None,
         toolbar: RECT::default(),
-        buttons: [RECT::default(); 6],
+        buttons: [RECT::default(); 7],
         hot: None,
         pressed: None,
         armed: false,
@@ -166,7 +167,7 @@ pub fn start(mode: Mode) {
 }
 
 fn layout_toolbar(st: &mut Overlay, mon: RECT) {
-    let labels = ["Region", "Window", "Screen", "Text", "", ""];
+    let labels = ["Region", "Window", "Screen", "Text", "Scroll", "", ""];
     let dpi = st.dpi;
     let pad = sc(14, dpi);
     let gap = sc(4, dpi);
@@ -177,18 +178,18 @@ fn layout_toolbar(st: &mut Overlay, mon: RECT) {
         let ws = labels
             .iter()
             .enumerate()
-            .map(|(i, l)| if i >= 4 { sc(32, dpi) } else { text_width(dc, l, st.font) + pad * 2 })
+            .map(|(i, l)| if i >= 5 { sc(32, dpi) } else { text_width(dc, l, st.font) + pad * 2 })
             .collect();
         ReleaseDC(None, dc);
         ws
     };
-    let total: i32 = widths.iter().sum::<i32>() + gap * 5 + inner * 2 + sc(8, dpi);
+    let total: i32 = widths.iter().sum::<i32>() + gap * 6 + inner * 2 + sc(8, dpi);
     let left = mon.left + (mon.right - mon.left - total) / 2;
     let top = mon.top + sc(18, dpi);
     st.toolbar = rect(left, top, left + total, top + h);
     let mut x = left + inner;
     for (i, w) in widths.iter().enumerate() {
-        if i == 4 {
+        if i == 5 {
             x += sc(8, dpi); // small separator before settings + close
         }
         st.buttons[i] = rect(x, top + inner, x + w, top + h - inner);
@@ -199,7 +200,7 @@ fn layout_toolbar(st: &mut Overlay, mon: RECT) {
 impl Overlay {
     fn selection(&self) -> Option<RECT> {
         match self.mode {
-            Mode::Region | Mode::Text => {
+            Mode::Region | Mode::Text | Mode::Scroll => {
                 if self.dragging {
                     let (x0, y0) = self.start;
                     let (x1, y1) = self.cur;
@@ -215,7 +216,7 @@ impl Overlay {
     fn update_hover(&mut self) {
         let (x, y) = self.cur;
         self.hover = match self.mode {
-            Mode::Region | Mode::Text => None,
+            Mode::Region | Mode::Text | Mode::Scroll => None,
             Mode::Window => self
                 .windows
                 .iter()
@@ -388,10 +389,10 @@ fn finish(hwnd: HWND, sel: RECT) {
     }
     if let Some((img, screen_rect, mode)) = result {
         if img.w > 0 && img.h > 0 {
-            if mode == Mode::Text {
-                crate::on_text(img, screen_rect);
-            } else {
-                crate::on_snip(img, screen_rect);
+            match mode {
+                Mode::Text => crate::on_text(img, screen_rect),
+                Mode::Scroll => crate::scroll::start(screen_rect),
+                _ => crate::on_snip(img, screen_rect),
             }
         }
     }
@@ -508,6 +509,7 @@ fn compose(st: &Overlay, rc: RECT) {
                 Mode::Window => 1,
                 Mode::Screen => 2,
                 Mode::Text => 3,
+                Mode::Scroll => 4,
             };
             if let Some(g) = Graphics::from_hdc(back) {
                 g.clip(rc.left, rc.top, w, h);
@@ -550,8 +552,8 @@ fn compose(st: &Overlay, rc: RECT) {
                     }
                 }
             }
-            let labels = ["Region", "Window", "Screen", "Text"];
-            for (i, b) in st.buttons.iter().take(4).enumerate() {
+            let labels = ["Region", "Window", "Screen", "Text", "Scroll"];
+            for (i, b) in st.buttons.iter().take(5).enumerate() {
                 let c = if i == active { argb(255, 255, 255, 255) } else { argb(255, 200, 200, 210) };
                 draw_text(back, labels[i], *b, st.font, c, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
@@ -560,10 +562,10 @@ fn compose(st: &Overlay, rc: RECT) {
                 g.clip(rc.left, rc.top, w, h);
                 let icon = |i: usize| if st.hot == Some(i) { argb(255, 255, 255, 255) } else { argb(255, 200, 200, 210) };
 
-                let b = st.buttons[4];
+                let b = st.buttons[5];
                 let cx = (b.left + b.right) as f32 / 2.0;
                 let cy = (b.top + b.bottom) as f32 / 2.0;
-                let c = icon(4);
+                let c = icon(5);
                 let ring = scf(4.6, dpi);
                 g.stroke_ellipse(cx, cy, ring, scf(2.4, dpi), c);
                 for k in 0..8 {
@@ -576,11 +578,11 @@ fn compose(st: &Overlay, rc: RECT) {
                     );
                 }
 
-                let b = st.buttons[5];
+                let b = st.buttons[6];
                 let cx = (b.left + b.right) as f32 / 2.0;
                 let cy = (b.top + b.bottom) as f32 / 2.0;
                 let k = scf(5.0, dpi);
-                let c = icon(5);
+                let c = icon(6);
                 g.line(cx - k, cy - k, cx + k, cy + k, scf(1.6, dpi), c);
                 g.line(cx - k, cy + k, cx + k, cy - k, scf(1.6, dpi), c);
             }
@@ -723,7 +725,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return LRESULT(0);
             }
             match st.mode {
-                Mode::Region | Mode::Text => {
+                Mode::Region | Mode::Text | Mode::Scroll => {
                     st.dragging = true;
                     st.start = (x, y);
                     st.cur = (x, y);
@@ -744,7 +746,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         1 => set_mode(hwnd, st, Mode::Window),
                         2 => set_mode(hwnd, st, Mode::Screen),
                         3 => set_mode(hwnd, st, Mode::Text),
-                        4 => {
+                        4 => set_mode(hwnd, st, Mode::Scroll),
+                        5 => {
                             cancel(hwnd);
                             crate::settings_ui::open();
                         }
@@ -794,6 +797,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 VK_2 | VK_W => set_mode(hwnd, st, Mode::Window),
                 VK_3 | VK_S | VK_F => set_mode(hwnd, st, Mode::Screen),
                 VK_4 | VK_T => set_mode(hwnd, st, Mode::Text),
+                VK_5 | VK_L => set_mode(hwnd, st, Mode::Scroll),
                 VK_RETURN | VK_SPACE => {
                     if let Some(sel) = st.hover {
                         finish(hwnd, sel);
