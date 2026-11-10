@@ -1679,7 +1679,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 VK_OEM_6 => set_size(hwnd, st, st.size + 1),              // ]
                 k => {
                     let c = char::from_u32(k.0 as u32).unwrap_or(' ');
-                    if let Some((t, _, _)) = TOOLS.iter().find(|t| t.2 == c) {
+                    // A tool's key re-pressed does nothing (only clicking Measure resets its scale).
+                    if let Some((t, _, _)) = TOOLS.iter().find(|t| t.2 == c && t.0 != st.tool) {
                         press(hwnd, st, Btn::Tool(*t));
                     }
                 }
