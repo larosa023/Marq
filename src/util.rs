@@ -291,6 +291,11 @@ pub fn ui_font(px: i32, weight: i32) -> HFONT {
 }
 
 pub fn draw_text(hdc: HDC, text: &str, rc: RECT, font: HFONT, color: u32, flags: DRAW_TEXT_FORMAT) {
+    // Never hand DrawText an empty buffer: Windows reads the first character anyway,
+    // and an empty Rust slice has no valid memory behind it (that crashed the editor).
+    if text.is_empty() {
+        return;
+    }
     unsafe {
         let old = SelectObject(hdc, font.into());
         SetBkMode(hdc, TRANSPARENT);
@@ -303,6 +308,9 @@ pub fn draw_text(hdc: HDC, text: &str, rc: RECT, font: HFONT, color: u32, flags:
 }
 
 pub fn text_width(hdc: HDC, text: &str, font: HFONT) -> i32 {
+    if text.is_empty() {
+        return 0;
+    }
     unsafe {
         let old = SelectObject(hdc, font.into());
         let w: Vec<u16> = text.encode_utf16().collect();

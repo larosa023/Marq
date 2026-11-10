@@ -347,6 +347,9 @@ fn font_px(px: i32, weight: i32) -> HFONT {
 
 /// GDI text with a throwaway font of the given pixel size.
 fn gdi_text(dc: HDC, text: &str, r: RECT, px: f32, weight: i32, color: u32, flags: DRAW_TEXT_FORMAT) {
+    if text.is_empty() {
+        return; // see util::draw_text
+    }
     let font = font_px(px.round() as i32, weight);
     unsafe {
         let old = SelectObject(dc, font.into());
@@ -361,6 +364,9 @@ fn gdi_text(dc: HDC, text: &str, r: RECT, px: f32, weight: i32, color: u32, flag
 }
 
 fn text_size(dc: HDC, text: &str, px: f32, weight: i32) -> (i32, i32) {
+    if text.is_empty() {
+        return (0, 0);
+    }
     let font = font_px(px.round() as i32, weight);
     unsafe {
         let old = SelectObject(dc, font.into());
