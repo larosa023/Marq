@@ -197,6 +197,13 @@ fn main() {
             );
         }
 
+        // `Marq.exe --edit <image>` opens an existing picture straight in the markup editor.
+        if let Some(i) = args.iter().position(|a| a == "--edit") {
+            if let Some(img) = args.get(i + 1).and_then(|p| gallery::load(p)) {
+                editor::open(img, None);
+            }
+        }
+
         SetTimer(Some(hwnd), TIMER_UPDATE_FIRST, FIRST_CHECK_MS, None);
         SetTimer(Some(hwnd), TIMER_TRIM, 3_000, None);
 

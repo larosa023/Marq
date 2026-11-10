@@ -99,6 +99,42 @@ fn save_png(px: &[u32], w: i32, h: i32, path: &PathBuf) -> bool {
     true
 }
 
+/// Load an image file (PNG, JPG, BMP, GIF) into pixels, via GDI+.
+pub fn load(path: &str) -> Option<crate::util::Image> {
+    unsafe {
+        let name = WStr::new(path);
+        let mut bmp: *mut GpBitmap = std::ptr::null_mut();
+        GdipCreateBitmapFromFile(name.p(), &mut bmp);
+        if bmp.is_null() {
+            return None;
+        }
+        let img = bmp as *mut GpImage;
+        let (mut w, mut h) = (0u32, 0u32);
+        GdipGetImageWidth(img, &mut w);
+        GdipGetImageHeight(img, &mut h);
+        let out = if w > 0 && h > 0 {
+            crate::util::Dib::new(w as i32, h as i32).map(|dib| {
+                let mut g = std::ptr::null_mut();
+                GdipCreateFromHDC(dib.dc, &mut g);
+                if !g.is_null() {
+                    GdipDrawImageRectI(g, img, 0, 0, w as i32, h as i32);
+                    GdipDeleteGraphics(g);
+                }
+                let _ = windows::Win32::Graphics::Gdi::GdiFlush();
+                let mut px = dib.pixels_mut().to_vec();
+                for p in px.iter_mut() {
+                    *p |= 0xFF00_0000;
+                }
+                crate::util::Image { w: w as i32, h: h as i32, px }
+            })
+        } else {
+            None
+        };
+        GdipDisposeImage(img);
+        out
+    }
+}
+
 pub fn open_folder() {
     if let Some(dir) = folder() {
         let p = WStr::new(&dir.to_string_lossy());

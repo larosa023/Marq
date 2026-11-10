@@ -6,7 +6,7 @@ name: Build & Release
 
 on:
   push:
-    branches: [main]
+    branches: [main, test]
   workflow_dispatch:
 
 permissions:
@@ -84,8 +84,19 @@ jobs:
             latest.txt
 
       # Draft first, upload, then go live: clients never see a release missing its files.
+      # Pushes to the `test` branch publish a pre-release for testing. The app's updater
+      # only follows the latest full release, so test builds never reach users.
+      - name: Publish test build
+        if: github.ref == 'refs/heads/test'
+        run: |
+          gh release delete test-build --yes --cleanup-tag 2>/dev/null || true
+          gh release create test-build Marq.exe latest.txt --prerelease --latest=false \
+            --title "Test build (not for use)" --target "${{ github.sha }}" --notes "Automated test build."
+        env:
+          GH_TOKEN: ${{ github.token }}
+
       - name: Publish release
-        if: steps.ver.outputs.exists == 'false'
+        if: steps.ver.outputs.exists == 'false' && github.ref == 'refs/heads/main'
         run: |
           TAG="v${{ steps.ver.outputs.version }}"
           if gh release view "$TAG" >/dev/null 2>&1; then
