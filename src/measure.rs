@@ -37,10 +37,17 @@ pub fn parse(input: &str) -> Option<(f64, Units)> {
         .replace("inch", "\"")
         .replace("in", "\"")
         .replace("''", "\"");
+    if s.trim_start().starts_with('-') {
+        return None; // negative
+    }
     let (feet_part, inch_part) = match s.find('\'') {
         Some(i) => (&s[..i], &s[i + 1..]),
         None if s.contains('"') => ("", s.as_str()),
-        None => (s.as_str(), ""), // bare number: feet
+        // "20-6" or "20-6 1/2" is shorthand for 20'-6".
+        None => match s.split_once('-') {
+            Some((f, i)) if !f.trim().is_empty() => (f, i),
+            _ => (s.as_str(), ""), // bare number: feet
+        },
     };
     let feet = if feet_part.trim().is_empty() { 0.0 } else { number(feet_part)? };
     let inch_str = inch_part.trim().trim_start_matches('-').trim().trim_end_matches('"').trim();
@@ -53,6 +60,10 @@ pub fn parse(input: &str) -> Option<(f64, Units)> {
 fn number(s: &str) -> Option<f64> {
     let s = s.trim();
     let parts: Vec<&str> = s.split(|c: char| c == ' ' || c == '-').filter(|p| !p.is_empty()).collect();
+    // Only "whole" or "whole fraction" (6 1/2). "20 6" is ambiguous, so refuse it.
+    if parts.is_empty() || parts.len() > 2 || (parts.len() == 2 && !parts[1].contains('/')) {
+        return None;
+    }
     let mut total = 0.0;
     for p in parts {
         if let Some((a, b)) = p.split_once('/') {
@@ -89,10 +100,11 @@ pub fn format(value: f64, units: Units) -> String {
             }
         }
         Units::Metric => {
-            if value >= 1000.0 {
+            let mm = value.round();
+            if mm >= 1000.0 {
                 format!("{:.2} m", value / 1000.0)
             } else {
-                format!("{} mm", value.round() as i64)
+                format!("{} mm", mm as i64)
             }
         }
     }
@@ -129,6 +141,10 @@ mod tests {
         assert_eq!(inches("20 ft 6 in"), 246.0);
         assert_eq!(inches("3 feet"), 36.0);
         assert_eq!(inches("20\u{2019} 6\u{201D}"), 246.0);
+        assert_eq!(inches("20-6"), 246.0);
+        assert_eq!(inches("20-6 1/2"), 246.5);
+        assert_eq!(inches("6'"), 72.0);
+        assert_eq!(inches("1/2\""), 0.5);
     }
     #[test]
     fn metric() {
@@ -143,6 +159,8 @@ mod tests {
         assert_eq!(parse("abc"), None);
         assert_eq!(parse("0"), None);
         assert_eq!(parse("1/0\""), None);
+        assert_eq!(parse("-5"), None);
+        assert_eq!(parse("20 6"), None);
     }
     #[test]
     fn formatting() {
@@ -152,6 +170,8 @@ mod tests {
         assert_eq!(format(240.0, Units::Imperial), "20'-0\"");
         assert_eq!(format(3250.0, Units::Metric), "3.25 m");
         assert_eq!(format(450.4, Units::Metric), "450 mm");
+        assert_eq!(format(999.6, Units::Metric), "1.00 m");
+        assert_eq!(format(11.9, Units::Imperial), "1'-0\"");
         assert_eq!(label(100.0, None), "100 px");
         let s = Scale { units: Units::Imperial, per_px: 2.46 };
         assert_eq!(label(100.0, Some(s)), "20'-6\"");

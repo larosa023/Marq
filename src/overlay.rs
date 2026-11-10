@@ -80,6 +80,11 @@ pub fn start(mode: Mode) {
     if OPEN.with(|o| o.get()) {
         return;
     }
+    // Starting a snip (tray, launching Marq again) during a scrolling capture finishes it.
+    if crate::scroll::active() {
+        crate::scroll::finish();
+        return;
+    }
     // Make sure our own preview card isn't in the frozen frame.
     if crate::toast::close_current() {
         unsafe {
@@ -391,7 +396,7 @@ fn finish(hwnd: HWND, sel: RECT) {
         if img.w > 0 && img.h > 0 {
             match mode {
                 Mode::Text => crate::on_text(img, screen_rect),
-                Mode::Scroll => crate::scroll::start(screen_rect),
+                Mode::Scroll if img.w >= 16 && img.h >= 32 => crate::scroll::start(screen_rect),
                 _ => crate::on_snip(img, screen_rect),
             }
         }

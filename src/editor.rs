@@ -604,6 +604,7 @@ fn apply_zoom(dib: &Dib, s: &Stroke) {
             tmp.h,
             SRCCOPY,
         );
+        let _ = GdiFlush();
     }
     zoom_border(dib.dc, dst, s.color, s.width, Map::IDENTITY);
 }
@@ -745,8 +746,13 @@ fn hint(st: &Editor) -> String {
     }
 }
 
+/// Badges already placed, including ones baked in before a crop.
 fn count_numbers(st: &Editor) -> usize {
-    st.strokes.iter().filter(|s| s.tool == Tool::Number).count()
+    st.strokes
+        .iter()
+        .chain(st.crops.iter().flat_map(|(_, v)| v))
+        .filter(|s| s.tool == Tool::Number)
+        .count()
 }
 
 fn layout(hwnd: HWND, st: &mut Editor) {
@@ -1049,6 +1055,7 @@ fn draw_zoom_placing(dc: HDC, st: &Editor, z: &ZoomPlacing) {
             (z.src.3 - z.src.1).round().max(1.0) as i32,
             SRCCOPY,
         );
+        let _ = GdiFlush();
     }
     zoom_border(dc, dst, z.color, z.width, m);
 }
@@ -1346,6 +1353,13 @@ fn end_text(hwnd: HWND, st: &mut Editor, keep: bool, refocus: bool) {
         }
         Purpose::Scale => {
             if let Some(mut s) = st.pending_measure.take() {
+                if !keep {
+                    // Esc: drop the line; the scale stays as it was.
+                    st.recalibrate = false;
+                    invalidate(hwnd, st.view);
+                    invalidate(hwnd, bar_rect(hwnd, st));
+                    return;
+                }
                 let px = dist(s.pts[0], s.pts[1]) as f64;
                 let typed = if keep { measure::parse(&text) } else { None };
                 match typed {
@@ -1597,8 +1611,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             };
             let s = st.current.as_ref().unwrap();
             let reach = s.reach();
-            let r = if matches!(tool, Tool::Crop) {
-                st.view // the shading covers the whole image
+            // Crop shading, measure labels and smoothed arrow curves can reach anywhere.
+            let r = if matches!(tool, Tool::Crop | Tool::Measure | Tool::Arrow) {
+                st.view
             } else {
                 match dirty {
                     // Free-hand: only the newest segment changed.
@@ -1681,7 +1696,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             // Closing right after a change: still put the final image on the clipboard.
             end_text(hwnd, st, true, false);
             st.zoom = None;
-            if st.current.is_some() {
+            if st.current.as_ref().map_or(false, |s| s.tool == Tool::Measure) {
+                // Don't open a scale box on a closing window: keep the line as measured.
+                let mut s = st.current.take().unwrap();
+                let _ = ReleaseCapture();
+                let px = dist(s.pts[0], s.pts[s.pts.len() - 1]) as f64;
+                s.text = measure::label(px, if st.recalibrate { None } else { st.cal });
+                commit(hwnd, st, s);
+            } else if st.current.is_some() {
                 finish_stroke(hwnd, st);
             }
             if st.copy_pending {

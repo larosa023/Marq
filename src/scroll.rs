@@ -24,7 +24,10 @@ const TIMER_TICK: usize = 1;
 const TICK_MS: u32 = 90;
 /// Stop growing past this height (keeps memory and the final PNG reasonable).
 const MAX_HEIGHT: usize = 30_000;
+/// ...and past this many pixels (~160 MB), whichever comes first.
+const MAX_PIXELS: usize = 40_000_000;
 const ACCENT: u32 = argb(255, 0x8B, 0x6F, 0xFF);
+const WM_MOUSELEAVE_: u32 = 0x02A3;
 
 // ---------------------------------------------------------------------------
 // Stitching (pure, unit-tested)
@@ -66,7 +69,8 @@ pub fn find_offset(prev: &[u64], next: &[u64], next_detail: &[bool], last_dy: us
     let bottom = h - h / 10;
     let min_rows = 8.max(h / 20);
     let mut best: Option<(f32, usize)> = None;
-    for dy in 1..=(h * 9 / 10) {
+    // dy = 0 too: a blinking caret or animation shouldn't look like a scroll.
+    for dy in 0..=(h * 9 / 10) {
         let end = bottom.min(h - dy);
         if end <= top {
             break;
@@ -90,9 +94,10 @@ pub fn find_offset(prev: &[u64], next: &[u64], next_detail: &[bool], last_dy: us
         }
         let better = match best {
             None => true,
+            // On a near-tie keep "didn't move", else prefer the step closest to the last one.
             Some((s, d)) => {
                 score > s + 0.02
-                    || ((score - s).abs() <= 0.02 && dy.abs_diff(last_dy) < d.abs_diff(last_dy))
+                    || ((score - s).abs() <= 0.02 && d != 0 && dy.abs_diff(last_dy) < d.abs_diff(last_dy))
             }
         };
         if better {
@@ -119,8 +124,20 @@ struct Session {
     dpi: u32,
     font: HFONT,
     font_b: HFONT,
-    lost: bool, // couldn't line the last frame up
+    status: Status,
     hot: Option<usize>,
+    ticks: u32,
+    /// Rows fixed at the bottom of the area (footer, status bar, sheet tabs) that
+    /// stay put while the page scrolls. Kept aside and added once at the end.
+    footer: Vec<u32>,
+    footer_rows: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Ok,
+    WentUp,
+    Lost,
 }
 
 impl Drop for Session {
@@ -142,7 +159,8 @@ pub fn active() -> bool {
 
 pub fn register() {
     register_class(&WStr::new(FRAME_CLASS), Some(frame_proc), IDC_ARROW, WNDCLASS_STYLES(0));
-    register_class(&WStr::new(BAR_CLASS), Some(bar_proc), IDC_HAND, CS_DROPSHADOW);
+    // No CS_DROPSHADOW: the shadow is a separate window that capture exclusion may miss.
+    register_class(&WStr::new(BAR_CLASS), Some(bar_proc), IDC_HAND, WNDCLASS_STYLES(0));
 }
 
 /// Start a scrolling capture of `r` (screen coordinates).
@@ -177,18 +195,24 @@ pub fn start(r: RECT) {
         hwnd
     };
 
-    // Control bar: below the area if there's room, else above, else inside the bottom edge.
+    // Control bar: somewhere outside the area if possible (below, above, right, left),
+    // otherwise just inside its bottom edge (it's excluded from capture there).
     let (bw, bh) = (sc(400, dpi), sc(46, dpi));
-    let bx = (cx - bw / 2).clamp(work.left, (work.right - bw).max(work.left));
-    let below = r.bottom + b + sc(10, dpi);
-    let above = r.top - b - sc(10, dpi) - bh;
-    let by = if below + bh <= work.bottom {
-        below
-    } else if above >= work.top {
-        above
-    } else {
-        r.bottom - bh - sc(12, dpi)
+    let gap = b + sc(10, dpi);
+    let hx = (cx - bw / 2).clamp(work.left, (work.right - bw).max(work.left));
+    let vy = (cy - bh / 2).clamp(work.top, (work.bottom - bh).max(work.top));
+    let candidates = [
+        (hx, r.bottom + gap),
+        (hx, r.top - gap - bh),
+        (r.right + gap, vy),
+        (r.left - gap - bw, vy),
+    ];
+    let fits = |&(x, y): &(i32, i32)| {
+        let c = rect(x, y, x + bw, y + bh);
+        c.left >= work.left && c.top >= work.top && c.right <= work.right && c.bottom <= work.bottom
+            && intersect(c, r).is_none()
     };
+    let (bx, by) = candidates.iter().copied().find(|c| fits(c)).unwrap_or((hx, r.bottom - bh - sc(12, dpi)));
     let bar = unsafe {
         let cls = WStr::new(BAR_CLASS);
         let title = WStr::new("Marq");
@@ -221,8 +245,11 @@ pub fn start(r: RECT) {
             dpi,
             font: ui_font(sc(13, dpi), 400),
             font_b: ui_font(sc(13, dpi), 600),
-            lost: false,
+            status: Status::Ok,
             hot: None,
+            ticks: 0,
+            footer: Vec::new(),
+            footer_rows: 0,
         })
     });
     unsafe {
@@ -259,47 +286,56 @@ fn tick() {
     }
     let Some(px) = grab(r) else { return };
     let mut full = false;
-    let mut repaint = false;
     SESSION.with(|cell| {
         let mut b = cell.borrow_mut();
         let Some(s) = b.as_mut() else { return };
+        s.ticks += 1;
         let (hashes, detail) = row_hashes(&px, s.w, s.h);
-        match &s.last {
-            None => {
-                s.stitched = px;
-                s.rows = s.h;
+        let before = (s.status, s.rows);
+        let Some((prev, _)) = s.last.as_ref() else {
+            s.stitched = px;
+            s.rows = s.h;
+            s.last = Some((hashes, detail));
+            let _ = unsafe { InvalidateRect(Some(s.bar), None, false) };
+            return;
+        };
+        let off = find_offset(prev, &hashes, &detail, s.last_dy);
+        // Rows at the bottom that didn't change: a fixed footer, not page content.
+        let still = (0..s.h / 3).take_while(|&i| hashes[s.h - 1 - i] == prev[s.h - 1 - i]).count();
+        let went_up = off.is_none() && find_offset(&hashes, prev, &s.last.as_ref().unwrap().1, 0).is_some();
+        match off {
+            Some(0) => {
+                // Same place (maybe with a blinking caret): track the latest look.
                 s.last = Some((hashes, detail));
-                repaint = true;
+                s.status = Status::Ok;
             }
-            Some((prev, _)) => match find_offset(prev, &hashes, &detail, s.last_dy) {
-                Some(0) => {
-                    if s.lost {
-                        s.lost = false;
-                        repaint = true;
-                    }
+            Some(dy) => {
+                if s.footer_rows == 0 && still >= 4 && still + dy < s.h {
+                    // First time we see a fixed footer: take it off the image for now.
+                    s.footer_rows = still;
+                    let keep = (s.rows - still) * s.w;
+                    s.footer = s.stitched.split_off(keep);
+                    s.rows -= still;
                 }
-                Some(dy) => {
-                    // Only the rows that just scrolled into view.
-                    s.stitched.extend_from_slice(&px[(s.h - dy) * s.w..]);
-                    s.rows += dy;
-                    s.last_dy = dy;
-                    s.last = Some((hashes, detail));
-                    s.lost = false;
-                    full = s.rows >= MAX_HEIGHT;
-                    repaint = true;
-                }
-                None => {
-                    if !s.lost {
-                        s.lost = true;
-                        repaint = true;
-                    }
-                }
-            },
+                let f = s.footer_rows.min(s.h - dy);
+                // Only the rows that just scrolled into view (above any fixed footer).
+                s.stitched.extend_from_slice(&px[(s.h - f - dy) * s.w..(s.h - f) * s.w]);
+                s.rows += dy;
+                s.last_dy = dy;
+                s.last = Some((hashes, detail));
+                s.status = Status::Ok;
+                full = s.rows >= MAX_HEIGHT || s.rows * s.w >= MAX_PIXELS;
+            }
+            None if s.ticks <= 3 && s.rows == s.h => {
+                // Very start: the first grab may have caught a hover effect or a late
+                // repaint. Start over from this frame instead.
+                s.stitched = px;
+                s.last = Some((hashes, detail));
+            }
+            None => s.status = if went_up { Status::WentUp } else { Status::Lost },
         }
-        if repaint {
-            unsafe {
-                let _ = InvalidateRect(Some(s.bar), None, false);
-            }
+        if (s.status, s.rows) != before {
+            let _ = unsafe { InvalidateRect(Some(s.bar), None, false) };
         }
     });
     if full {
@@ -330,6 +366,10 @@ pub fn finish() {
     if s.rows == 0 {
         return;
     }
+    // Put the fixed footer back, once, at the very bottom.
+    let footer = std::mem::take(&mut s.footer);
+    s.rows += footer.len() / s.w.max(1);
+    s.stitched.extend_from_slice(&footer);
     let img = Image { w: s.w as i32, h: s.rows as i32, px: std::mem::take(&mut s.stitched) };
     let near = s.rect;
     drop(s);
@@ -384,15 +424,17 @@ fn paint_bar(hwnd: HWND, s: &Session) {
             let dpi = s.dpi;
             if let Some(g) = Graphics::from_hdc(back.dc) {
                 g.fill_round_rect(0.0, 0.0, rc.right as f32, rc.bottom as f32, 0.0, argb(255, 30, 30, 34));
-                let dot = if s.lost { argb(255, 0xFF, 0x9F, 0x0A) } else { argb(255, 0xFF, 0x3B, 0x30) };
+                let dot = if s.status != Status::Ok { argb(255, 0xFF, 0x9F, 0x0A) } else { argb(255, 0xFF, 0x3B, 0x30) };
                 g.fill_ellipse(scf(18.0, dpi), rc.bottom as f32 / 2.0, scf(4.5, dpi), dot);
                 let c = if s.hot == Some(0) { argb(255, 0x9E, 0x86, 0xFF) } else { ACCENT };
                 g.fill_round_rect(done.left as f32, done.top as f32, rect_w(&done) as f32, rect_h(&done) as f32, scf(8.0, dpi), c);
                 let c = if s.hot == Some(1) { argb(255, 62, 62, 70) } else { argb(255, 48, 48, 54) };
                 g.fill_round_rect(cancel.left as f32, cancel.top as f32, rect_w(&cancel) as f32, rect_h(&cancel) as f32, scf(8.0, dpi), c);
             }
-            let msg = if s.lost {
-                "Scroll back up a little \u{2014} too fast".to_string()
+            let msg = if s.status == Status::WentUp {
+                "Scroll down to continue".to_string()
+            } else if s.status == Status::Lost {
+                "Lost track \u{2014} scroll back to where you were".to_string()
             } else if s.rows == 0 {
                 "Scroll down to capture more".to_string()
             } else {
@@ -442,7 +484,23 @@ unsafe extern "system" fn bar_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             tick();
             LRESULT(0)
         }
+        WM_MOUSELEAVE_ => {
+            SESSION.with(|c| {
+                if let Some(s) = c.borrow_mut().as_mut() {
+                    s.hot = None;
+                }
+            });
+            let _ = InvalidateRect(Some(hwnd), None, false);
+            LRESULT(0)
+        }
         WM_MOUSEMOVE => {
+            let mut tme = windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<windows::Win32::UI::Input::KeyboardAndMouse::TRACKMOUSEEVENT>() as u32,
+                dwFlags: windows::Win32::UI::Input::KeyboardAndMouse::TME_LEAVE,
+                hwndTrack: hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::TrackMouseEvent(&mut tme);
             let (x, y) = lparam_point(lp);
             let mut rc = RECT::default();
             let _ = GetClientRect(hwnd, &mut rc);
@@ -548,6 +606,20 @@ mod tests {
         }
         assert_eq!(rows, top + h);
         assert_eq!(stitched, window(&p, w, 0, top + h));
+    }
+
+    #[test]
+    fn blinking_caret_is_not_a_scroll() {
+        let (w, h) = (40, 200);
+        let p = page(1000, w);
+        let a = window(&p, w, 0, h);
+        let mut b = a.clone();
+        for y in 90..100 {
+            b[y * w + 5] ^= 0xFFFFFF; // a caret blinked
+        }
+        let (ha, _) = row_hashes(&a, w, h);
+        let (hb, db) = row_hashes(&b, w, h);
+        assert_eq!(find_offset(&ha, &hb, &db, 30), Some(0));
     }
 
     #[test]

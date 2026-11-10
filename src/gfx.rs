@@ -139,13 +139,15 @@ impl Graphics {
         }
         let head_len = (width * 4.5).min(total * 0.6).max(width * 2.0);
         let tip = pts[pts.len() - 1];
-        // Walk back from the tip one head-length to find the head's direction.
+        // Walk back from the tip to find the head's direction. Looking a bit further
+        // than one head-length keeps a flick at the very end from twisting the head.
+        let look = head_len.max(total * 0.15);
         let mut back = pts[0];
         let mut acc = 0.0;
         for i in (1..pts.len()).rev() {
             let seg = dist(pts[i - 1], pts[i]);
-            if acc + seg >= head_len {
-                let t = (head_len - acc) / seg.max(1e-3);
+            if acc + seg >= look {
+                let t = (look - acc) / seg.max(1e-3);
                 back = (pts[i].0 + (pts[i - 1].0 - pts[i].0) * t, pts[i].1 + (pts[i - 1].1 - pts[i].1) * t);
                 break;
             }
