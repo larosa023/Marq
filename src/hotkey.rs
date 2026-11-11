@@ -33,6 +33,8 @@ static REC_TARGET: AtomicIsize = AtomicIsize::new(0); // non-zero while recordin
 static REC_MESSAGE: AtomicU32 = AtomicU32::new(0);
 static SWALLOW_UP: AtomicU32 = AtomicU32::new(0); // key whose release we also hide
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+static ESC_TARGET: AtomicIsize = AtomicIsize::new(0); // non-zero: Esc goes here (scroll capture)
+static ESC_MESSAGE: AtomicU32 = AtomicU32::new(0);
 
 const LLKHF_INJECTED: u32 = 0x10;
 /// An unassigned virtual-key code. Tapping it tells Windows "another key was pressed",
@@ -42,6 +44,16 @@ const VK_DUMMY: u16 = 0xFF;
 pub fn set(mods: u32, vk: u32) {
     MODS.store(mods, Ordering::Relaxed);
     VK.store(vk, Ordering::Relaxed);
+}
+
+/// While set, Esc (with no modifiers) is swallowed and reported to `hwnd`.
+pub fn set_escape(hwnd: HWND, msg: u32) {
+    ESC_MESSAGE.store(msg, Ordering::Relaxed);
+    ESC_TARGET.store(hwnd.0 as isize, Ordering::Relaxed);
+}
+
+pub fn clear_escape() {
+    ESC_TARGET.store(0, Ordering::Relaxed);
 }
 
 pub fn installed() -> bool {
@@ -139,6 +151,17 @@ unsafe extern "system" fn hook_proc(code: i32, wp: WPARAM, lp: LPARAM) -> LRESUL
             }
             if is_down {
                 let mods = current_mods();
+                let esc = ESC_TARGET.load(Ordering::Relaxed);
+                if esc != 0 && vk == VK_ESCAPE.0 as u32 && mods == 0 {
+                    SWALLOW_UP.store(vk, Ordering::Relaxed);
+                    let _ = PostMessageW(
+                        Some(HWND(esc as *mut _)),
+                        ESC_MESSAGE.load(Ordering::Relaxed),
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                    return LRESULT(1);
+                }
                 let rec = REC_TARGET.load(Ordering::Relaxed);
                 let hit = rec == 0 && vk == VK.load(Ordering::Relaxed) && mods == MODS.load(Ordering::Relaxed);
                 if rec != 0 || hit {

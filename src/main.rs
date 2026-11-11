@@ -17,6 +17,7 @@ mod overlay;
 mod scroll;
 mod settings;
 mod settings_ui;
+mod stitch;
 mod toast;
 mod updater;
 mod util;
