@@ -439,7 +439,7 @@ fn paint_bar(hwnd: HWND, s: &Session) {
             } else if s.status == Status::Lost {
                 "Lost track \u{2014} scroll back up a little".to_string()
             } else if s.paused {
-                format!("Paused \u{00B7} {} px \u{00B7} point at the area to continue", group(s.rows))
+                format!("Paused \u{00B7} {} px \u{00B7} hover the area to resume", group(s.rows))
             } else if s.rows == 0 {
                 "Starting\u{2026}".to_string()
             } else {

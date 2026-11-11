@@ -18,7 +18,7 @@ A hyper-lightweight screen snipping tool for Windows. It lives in the system tra
 | Window | Press **W** (or click *Window*), then click a window |
 | Full screen | Press **S** (or click *Screen*), then click a monitor |
 | Copy text | Press **T** (or click *Text*), then drag over text; the text is copied instead of the picture |
-| Scrolling capture | Press **L** (or click *Scroll*), drag the area, then scroll down; click **Done** (or press the snip shortcut) |
+| Scrolling capture | Press **L** (or click *Scroll*) and drag the area; Marq scrolls it for you. **Esc** or **Done** finishes early |
 | Settings | Click the **gear** in the snip toolbar, or right-click the tray icon → *Settings* |
 | Cancel | **Esc** or right-click |
 
@@ -32,7 +32,7 @@ The snip is copied to the clipboard immediately and saved as a PNG to **Pictures
 
 **Magnifier:** turn on *Magnifier while selecting* in Settings for a pixel-level zoom, coordinates and color next to the cursor, for lining up edges exactly.
 
-**Scrolling capture:** pick the area that scrolls (a web page, a long spreadsheet), then scroll down at a normal pace. Marq keeps capturing and stitches the new part onto the bottom, building one tall image. A bar shows how tall it is; if you scroll too fast it asks you to scroll back up a little. Click **Done** and it's copied and saved like any snip.
+**Scrolling capture:** pick the area that scrolls (a web page, a long spreadsheet) and let go. Marq puts the pointer on the area and scrolls it down by itself, stitching each new part onto the bottom into one tall image, and stops on its own at the end of the page. Want control back? Move the pointer off the area and it pauses; move it back and it carries on (you can also scroll by hand). Press **Esc** or click **Done** to finish early. The result is copied and saved like any snip. Fixed headers and footers are only kept once.
 
 **Markup** (each tool has a key; hover a button for its name and tips):
 
