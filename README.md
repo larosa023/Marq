@@ -40,7 +40,8 @@ The snip is copied to the clipboard immediately and saved as a PNG to **Pictures
 | --- | --- | --- |
 | Pen | **P** | Draw freely |
 | Marker | **H** | Highlight |
-| Arrow | **A** | Drag straight, or draw a curve and the arrow follows it; Shift = straight at 0/45/90° |
+| Arrow | **A** | Drag from tail to tip for a straight arrow; Shift = snap to 0/45/90° |
+| Curved arrow | **V** | Draw any path and the arrow follows it as a smooth curve |
 | Box | **R** | Drag; Shift = square |
 | Circle | **O** | Drag; stretch for an oval, Shift = perfect circle |
 | Text | **T** | Click, type, press Enter |

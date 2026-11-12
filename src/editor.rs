@@ -1,4 +1,4 @@
-//! Markup editor: pen, marker, arrow (straight or curved), box, circle, text, numbers,
+//! Markup editor: pen, marker, arrow, curved arrow, box, circle, text, numbers,
 //! measure, zoom callout, blur and crop; five colors, three thicknesses, undo.
 //! Every change re-copies the image to the clipboard (and the Gallery file) automatically.
 //!
@@ -52,6 +52,7 @@ enum Tool {
     Pen,
     Highlighter,
     Arrow,
+    Curve,
     Rect,
     Ellipse,
     Text,
@@ -63,10 +64,11 @@ enum Tool {
 }
 
 /// Toolbar order, name, and shortcut key.
-const TOOLS: [(Tool, &str, char); 11] = [
+const TOOLS: [(Tool, &str, char); 12] = [
     (Tool::Pen, "Pen", 'P'),
     (Tool::Highlighter, "Marker", 'H'),
     (Tool::Arrow, "Arrow", 'A'),
+    (Tool::Curve, "Curved arrow", 'V'),
     (Tool::Rect, "Box", 'R'),
     (Tool::Ellipse, "Circle", 'O'),
     (Tool::Text, "Text", 'T'),
@@ -113,7 +115,7 @@ impl Stroke {
     /// How far ink can reach beyond the points.
     fn reach(&self) -> f32 {
         match self.tool {
-            Tool::Arrow => self.width * 4.0 + 2.0,
+            Tool::Arrow | Tool::Curve => self.width * 4.0 + 2.0,
             Tool::Measure => self.width * 8.0 + 30.0, // end ticks + label
             Tool::Blur | Tool::Crop | Tool::Zoom => 3.0,
             _ => self.width / 2.0 + 2.0,
@@ -313,7 +315,7 @@ fn base_width(tool: Tool) -> f32 {
     match tool {
         Tool::Pen | Tool::Rect | Tool::Ellipse => 4.0,
         Tool::Highlighter => 22.0,
-        Tool::Arrow => 5.0,
+        Tool::Arrow | Tool::Curve => 5.0,
         Tool::Measure => 2.5,
         Tool::Number => 13.0, // badge radius
         Tool::Text => TEXT_PX[1] as f32,
@@ -418,7 +420,7 @@ fn ink_on(color: u32) -> u32 {
 fn render(dc: HDC, s: &Stroke, m: Map) {
     let w = s.width * m.k;
     match s.tool {
-        Tool::Pen | Tool::Highlighter | Tool::Arrow | Tool::Rect | Tool::Ellipse => {
+        Tool::Pen | Tool::Highlighter | Tool::Arrow | Tool::Curve | Tool::Rect | Tool::Ellipse => {
             let Some(g) = Graphics::from_hdc(dc) else { return };
             match s.tool {
                 Tool::Pen => {
@@ -429,7 +431,7 @@ fn render(dc: HDC, s: &Stroke, m: Map) {
                     let pts: Vec<_> = s.pts.iter().map(|&p| m.p(p)).collect();
                     g.polyline(&pts, w, (s.color & 0x00FF_FFFF) | (0x70 << 24), true);
                 }
-                Tool::Arrow => {
+                Tool::Arrow | Tool::Curve => {
                     let pts: Vec<_> = arrow_points(&s.pts, s.width).iter().map(|&p| m.p(p)).collect();
                     g.arrow_path(&pts, w, s.color);
                 }
@@ -670,11 +672,17 @@ fn draw_icon(g: &Graphics, t: Tool, cx: f32, cy: f32, dpi: u32, c: u32) {
         Tool::Highlighter => {
             g.polyline(&[(cx - u(5.5), cy + u(3.5)), (cx + u(5.5), cy - u(3.5))], u(6.0), (c & 0x00FF_FFFF) | (0x99 << 24), true);
         }
-        Tool::Arrow => g.arrow_path(
-            &[(cx - u(7.0), cy + u(5.0)), (cx - u(1.0), cy - u(5.0)), (cx + u(7.0), cy - u(4.0))],
-            u(1.8),
-            c,
-        ),
+        Tool::Arrow => g.arrow_path(&[(cx - u(6.5), cy + u(6.5)), (cx + u(6.5), cy - u(6.5))], u(1.8), c),
+        Tool::Curve => {
+            // A hump: up from the lower left, over, and down into the head.
+            let pts: Vec<_> = (0..=8)
+                .map(|i| {
+                    let t = i as f32 / 8.0 * 2.0 - 1.0;
+                    (cx + u(7.0) * t, cy + u(5.0) - u(10.0) * (1.0 - t * t))
+                })
+                .collect();
+            g.arrow_path(&pts, u(1.6), c);
+        }
         Tool::Rect => g.stroke_round_rect(cx - u(7.0), cy - u(5.5), u(14.0), u(11.0), u(1.5), lw, c),
         Tool::Ellipse => g.stroke_ellipse_box(cx - u(7.5), cy - u(5.5), u(15.0), u(11.0), lw, c),
         Tool::Text => {
@@ -736,7 +744,8 @@ fn hint(st: &Editor) -> String {
         return "Click where the zoomed copy goes \u{00B7} Esc cancels".into();
     }
     match st.tool {
-        Tool::Arrow => "Draw a curve to bend the arrow \u{00B7} Shift = straight".into(),
+        Tool::Arrow => "Drag from tail to tip \u{00B7} Shift = snap to 45\u{00B0}".into(),
+        Tool::Curve => "Draw the path the arrow should follow".into(),
         Tool::Rect => "Shift = perfect square".into(),
         Tool::Ellipse => "Stretch for an oval \u{00B7} Shift = perfect circle".into(),
         Tool::Text => "Click, type, press Enter".into(),
@@ -1188,8 +1197,8 @@ fn finish_stroke(hwnd: HWND, st: &mut Editor) {
     let discard = |hwnd: HWND, st: &Editor, crop_like: bool| {
         invalidate(hwnd, if crop_like { st.view } else { dirty });
     };
-    if s.tool.two_point() || s.tool == Tool::Arrow {
-        let (x0, y0, x1, y1) = if s.tool == Tool::Arrow {
+    if s.tool.two_point() || matches!(s.tool, Tool::Arrow | Tool::Curve) {
+        let (x0, y0, x1, y1) = if matches!(s.tool, Tool::Arrow | Tool::Curve) {
             s.pts.iter().fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |b, p| {
                 (b.0.min(p.0), b.1.min(p.1), b.2.max(p.0), b.3.max(p.1))
             })
@@ -1198,7 +1207,7 @@ fn finish_stroke(hwnd: HWND, st: &mut Editor) {
         };
         let (w, h) = ((x1 - x0) * st.scale, (y1 - y0) * st.scale);
         let too_small = match s.tool {
-            Tool::Arrow | Tool::Measure => (w * w + h * h).sqrt() < 6.0,
+            Tool::Arrow | Tool::Curve | Tool::Measure => (w * w + h * h).sqrt() < 6.0,
             _ => w < 4.0 || h < 4.0,
         };
         if too_small {
@@ -1225,7 +1234,7 @@ fn finish_stroke(hwnd: HWND, st: &mut Editor) {
                 commit(hwnd, st, s);
             }
         }
-        Tool::Arrow => {
+        Tool::Arrow | Tool::Curve => {
             s.pts = arrow_points(&s.pts, s.width);
             invalidate(hwnd, dirty);
             commit(hwnd, st, s);
@@ -1607,18 +1616,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     let n = s.pts.len() - 1;
                     s.pts[n] = p;
                     None
-                } else if tool == Tool::Arrow && shift {
+                } else if tool == Tool::Arrow {
                     s.pts = vec![origin, p];
                     None
                 } else {
                     s.pts.push(p);
-                    if tool == Tool::Arrow { None } else { Some([last, p]) }
+                    if tool == Tool::Curve { None } else { Some([last, p]) }
                 }
             };
             let s = st.current.as_ref().unwrap();
             let reach = s.reach();
             // Crop shading, measure labels and smoothed arrow curves can reach anywhere.
-            let r = if matches!(tool, Tool::Crop | Tool::Measure | Tool::Arrow) {
+            let r = if matches!(tool, Tool::Crop | Tool::Measure | Tool::Curve) {
                 st.view
             } else {
                 match dirty {
