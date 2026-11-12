@@ -2,8 +2,9 @@
 //! it goes and stitching the newly revealed rows onto the bottom, building one tall
 //! image. It stops by itself at the end of the page. You can also scroll by hand.
 //!
-//! Frames are lined up by `stitch::find_offset`, which tolerates fractional-pixel
-//! scrolling, anti-aliasing noise and sticky headers/footers (see stitch.rs).
+//! All the deciding (when to scroll, how far, lining frames up, when it's done) is in
+//! `stitch::Scroller`, which is pure and tested against real browser pages. This file
+//! is the Windows side: grabbing the area, turning the wheel, and the outline and bar.
 //!
 //! The outline and the control bar are excluded from screen capture by Windows
 //! (WDA_EXCLUDEFROMCAPTURE), so they never end up in the image.
@@ -16,29 +17,17 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::gfx::{argb, Graphics};
-use crate::stitch::{find_offset, signature, still_bottom, Sig};
+use crate::stitch::{Action, Scroller, Status};
 use crate::util::*;
 
 const FRAME_CLASS: &str = "MarqScrollFrame";
 const BAR_CLASS: &str = "MarqScrollBar";
 const TIMER_TICK: usize = 1;
 const TICK_MS: u32 = 90;
-/// Stop growing past this height (keeps memory and the final PNG reasonable).
-const MAX_HEIGHT: usize = 30_000;
-/// ...and past this many pixels (~160 MB), whichever comes first.
-const MAX_PIXELS: usize = 40_000_000;
 const ACCENT: u32 = argb(255, 0x8B, 0x6F, 0xFF);
 const WM_MOUSELEAVE_: u32 = 0x02A3;
 /// From the keyboard hook: Esc was pressed during the capture.
 const WM_APP_ESC: u32 = WM_APP + 40;
-/// Auto-scroll: wait at least this many ticks after scrolling before judging the result...
-const SETTLE_TICKS: u32 = 3;
-/// ...and stop waiting for the page to sit still after this many (animated pages).
-const MAX_SETTLE_TICKS: u32 = 14;
-/// Wheel amount per step (120 = one notch). Adapted so each step moves ~45% of the area.
-const STEP_START: i32 = 120;
-const STEP_MIN: i32 = 20;
-const STEP_MAX: i32 = 1200;
 
 // ---------------------------------------------------------------------------
 // Session
@@ -46,38 +35,15 @@ const STEP_MAX: i32 = 1200;
 
 struct Session {
     rect: RECT, // screen coordinates of the captured area
-    w: usize,
-    h: usize,
-    stitched: Vec<u32>,
-    rows: usize,
-    last: Option<Sig>,
-    last_dy: usize,
+    cap: Scroller,
     frame: HWND,
     bar: HWND,
     dpi: u32,
     font: HFONT,
     font_b: HFONT,
-    status: Status,
     hot: Option<usize>,
-    ticks: u32,
-    /// Rows fixed at the bottom of the area (footer, status bar, sheet tabs) that
-    /// stay put while the page scrolls. Kept aside and added once at the end.
-    footer: Vec<u32>,
-    footer_rows: usize,
-    // Auto-scroll.
-    step: i32,            // wheel amount per step
-    since_send: u32,      // ticks since the last step
-    moved_since_send: usize,
-    sent_once: bool,
-    stuck: u32,           // steps in a row that moved nothing (end of the page)
-    paused: bool,         // pointer left the area: the user wants control
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Status {
-    Ok,
-    WentUp,
-    Lost,
+    /// What the bar shows, to repaint only when it changes.
+    shown: (Status, usize),
 }
 
 impl Drop for Session {
@@ -137,7 +103,7 @@ pub fn start(r: RECT) {
 
     // Control bar: somewhere outside the area if possible (below, above, right, left),
     // otherwise just inside its bottom edge (it's excluded from capture there).
-    let (bw, bh) = (sc(470, dpi), sc(46, dpi));
+    let (bw, bh) = (sc(520, dpi), sc(46, dpi));
     let gap = b + sc(10, dpi);
     let hx = (cx - bw / 2).clamp(work.left, (work.right - bw).max(work.left));
     let vy = (cy - bh / 2).clamp(work.top, (work.bottom - bh).max(work.top));
@@ -174,35 +140,23 @@ pub fn start(r: RECT) {
     SESSION.with(|s| {
         *s.borrow_mut() = Some(Session {
             rect: r,
-            w,
-            h,
-            stitched: Vec::new(),
-            rows: 0,
-            last: None,
-            last_dy: 0,
+            cap: Scroller::new(w, h),
             frame,
             bar,
             dpi,
             font: ui_font(sc(13, dpi), 400),
             font_b: ui_font(sc(13, dpi), 600),
-            status: Status::Ok,
             hot: None,
-            ticks: 0,
-            footer: Vec::new(),
-            footer_rows: 0,
-            step: STEP_START,
-            since_send: 0,
-            moved_since_send: 0,
-            sent_once: false,
-            stuck: 0,
-            paused: false,
+            shown: (Status::Starting, 0),
         })
     });
     unsafe {
         let _ = ShowWindow(frame, SW_SHOWNOACTIVATE);
         let _ = ShowWindow(bar, SW_SHOWNOACTIVATE);
-        // Auto-scroll sends the wheel to whatever is under the pointer: put it on the area.
-        let _ = SetCursorPos(cx, cy);
+        // Auto-scroll sends the wheel to whatever is under the pointer: put it on the
+        // area, a quarter of the way down, so what it lights up on hover is above the
+        // rows each step adds.
+        let _ = SetCursorPos(cx, r.top + rect_h(&r) / 4);
         crate::hotkey::set_escape(bar, WM_APP_ESC);
         // First frame on the first tick, once the snip overlay has left the screen.
         SetTimer(Some(bar), TIMER_TICK, TICK_MS, None);
@@ -239,109 +193,33 @@ fn wheel(amount: i32) {
     }
 }
 
-/// Grab the area, add whatever scrolled into view, and take the next auto-scroll step.
+/// Grab the area and let the Scroller decide what's next.
 fn tick() {
     let Some(r) = SESSION.with(|s| s.borrow().as_ref().map(|s| s.rect)) else { return };
-    if SESSION.with(|s| s.borrow().as_ref().map_or(true, |s| s.last.is_none())) {
+    if SESSION.with(|s| s.borrow().as_ref().map_or(true, |s| s.cap.is_empty())) {
         unsafe {
-            let _ = DwmFlush();
+            let _ = DwmFlush(); // the first frame: make sure the snip overlay is gone
         }
     }
     let Some(px) = grab(r) else { return };
-    let (mut full, mut at_end) = (false, false);
-    let mut send: Option<i32> = None;
-    SESSION.with(|cell| {
+    let (cx, cy) = cursor_pos();
+    let pointer = pt_in(&r, cx, cy).then(|| ((cx - r.left) as usize, (cy - r.top) as usize));
+    let action = SESSION.with(|cell| {
         let mut b = cell.borrow_mut();
-        let Some(s) = b.as_mut() else { return };
-        s.ticks += 1;
-        let sig = signature(&px, s.w, s.h);
-        let before = (s.status, s.rows, s.paused);
-        let Some(prev) = s.last.as_ref() else {
-            s.stitched = px;
-            s.rows = s.h;
-            s.last = Some(sig);
-            let _ = unsafe { InvalidateRect(Some(s.bar), None, false) };
-            return;
-        };
-        let off = find_offset(prev, &sig, s.last_dy);
-        // Rows at the bottom that didn't change: a fixed footer, not page content.
-        let still = still_bottom(prev, &sig);
-        let went_up = off.is_none() && find_offset(&sig, prev, 0).is_some();
-        match off {
-            Some(0) => {
-                // Same place (maybe with a blinking caret): track the latest look.
-                s.last = Some(sig);
-                s.status = Status::Ok;
-            }
-            Some(dy) => {
-                if s.footer_rows == 0 && still >= 4 && still + dy < s.h && s.rows >= still {
-                    // First time we see a fixed footer: take it off the image for now.
-                    s.footer_rows = still;
-                    let keep = (s.rows - still) * s.w;
-                    s.footer = s.stitched.split_off(keep);
-                    s.rows -= still;
-                }
-                let f = s.footer_rows.min(s.h - dy);
-                // Only the rows that just scrolled into view (above any fixed footer).
-                s.stitched.extend_from_slice(&px[(s.h - f - dy) * s.w..(s.h - f) * s.w]);
-                s.rows += dy;
-                s.moved_since_send += dy;
-                s.last_dy = dy;
-                s.last = Some(sig);
-                s.status = Status::Ok;
-                full = s.rows >= MAX_HEIGHT || s.rows * s.w >= MAX_PIXELS;
-            }
-            None if s.ticks <= 3 && s.rows == s.h => {
-                // Very start: the first grab may have caught a hover effect or a late
-                // repaint. Start over from this frame instead.
-                s.stitched = px;
-                s.last = Some(sig);
-            }
-            None => s.status = if went_up { Status::WentUp } else { Status::Lost },
-        }
-
-        // Auto-scroll: one step at a time, each once the page has settled.
-        s.since_send += 1;
-        let (cx, cy) = cursor_pos();
-        s.paused = !pt_in(&s.rect, cx, cy);
-        let settled = off == Some(0) || s.since_send >= MAX_SETTLE_TICKS;
-        if !s.paused && s.status == Status::Ok && settled && s.since_send >= SETTLE_TICKS {
-            if s.sent_once {
-                if s.moved_since_send == 0 {
-                    s.stuck += 1;
-                } else {
-                    s.stuck = 0;
-                    // Aim for ~45% of the area per step: plenty of overlap to line up.
-                    let target = (s.h as f32 * 0.45).max(8.0);
-                    let ratio = s.moved_since_send as f32 / target;
-                    s.step = ((s.step as f32 / ratio.max(0.05)).round() as i32).clamp(STEP_MIN, STEP_MAX);
-                }
-            }
-            if s.stuck >= 2 {
-                at_end = true; // two steps that moved nothing: the end of the page
-            } else {
-                send = Some(s.step);
-                s.since_send = 0;
-                s.moved_since_send = 0;
-                s.sent_once = true;
-            }
-        } else if s.status == Status::Lost && !s.paused && s.since_send >= MAX_SETTLE_TICKS {
-            // Lost track mid auto-scroll: go back up a little and take smaller steps.
-            s.step = (s.step / 2).max(STEP_MIN);
-            send = Some(-s.step);
-            s.since_send = 0;
-            s.moved_since_send = 0;
-            s.sent_once = false;
-        }
-        if (s.status, s.rows, s.paused) != before {
+        let s = b.as_mut()?;
+        let a = s.cap.feed(px, pointer);
+        let now = (s.cap.status(), s.cap.rows());
+        if now != s.shown {
+            s.shown = now;
             let _ = unsafe { InvalidateRect(Some(s.bar), None, false) };
         }
+        Some(a)
     });
-    if let Some(amount) = send {
-        wheel(amount);
-    }
-    if full || at_end {
-        finish();
+    // Outside the borrow: the wheel and finishing can re-enter the window procedures.
+    match action {
+        Some(Action::Wheel(n)) => wheel(n),
+        Some(Action::Finish) => finish(),
+        _ => {}
     }
 }
 
@@ -359,23 +237,20 @@ fn close() -> Option<Session> {
 /// Stop and hand the tall image to the app (clipboard, Gallery, preview card).
 pub fn finish() {
     let Some(mut s) = close() else { return };
-    if s.rows == 0 {
-        // Finished before the first tick: just take what's there now.
-        if let Some(px) = grab(s.rect) {
-            s.stitched = px;
-            s.rows = s.h;
+    let (w, near) = (s.cap.w(), s.rect);
+    let (px, rows) = if s.cap.is_empty() {
+        // Finished before the first frame: just take what's there now.
+        match grab(s.rect) {
+            Some(px) => (px, rect_h(&s.rect) as usize),
+            None => return,
         }
-    }
-    if s.rows == 0 {
+    } else {
+        std::mem::replace(&mut s.cap, Scroller::new(0, 0)).into_image()
+    };
+    if rows == 0 {
         return;
     }
-    // Put the fixed footer back, once, at the very bottom.
-    let footer = std::mem::take(&mut s.footer);
-    s.rows += footer.len() / s.w.max(1);
-    s.stitched.extend_from_slice(&footer);
-    let img = Image { w: s.w as i32, h: s.rows as i32, px: std::mem::take(&mut s.stitched) };
-    let near = s.rect;
-    drop(s);
+    let img = Image { w: w as i32, h: rows as i32, px };
     crate::on_snip(img, near);
     trim_memory();
 }
@@ -427,23 +302,23 @@ fn paint_bar(hwnd: HWND, s: &Session) {
             let dpi = s.dpi;
             if let Some(g) = Graphics::from_hdc(back.dc) {
                 g.fill_round_rect(0.0, 0.0, rc.right as f32, rc.bottom as f32, 0.0, argb(255, 30, 30, 34));
-                let dot = if s.status != Status::Ok || s.paused { argb(255, 0xFF, 0x9F, 0x0A) } else { argb(255, 0xFF, 0x3B, 0x30) };
+                let dot = match s.cap.status() {
+                    Status::Scrolling | Status::Starting => argb(255, 0xFF, 0x3B, 0x30),
+                    _ => argb(255, 0xFF, 0x9F, 0x0A),
+                };
                 g.fill_ellipse(scf(18.0, dpi), rc.bottom as f32 / 2.0, scf(4.5, dpi), dot);
                 let c = if s.hot == Some(0) { argb(255, 0x9E, 0x86, 0xFF) } else { ACCENT };
                 g.fill_round_rect(done.left as f32, done.top as f32, rect_w(&done) as f32, rect_h(&done) as f32, scf(8.0, dpi), c);
                 let c = if s.hot == Some(1) { argb(255, 62, 62, 70) } else { argb(255, 48, 48, 54) };
                 g.fill_round_rect(cancel.left as f32, cancel.top as f32, rect_w(&cancel) as f32, rect_h(&cancel) as f32, scf(8.0, dpi), c);
             }
-            let msg = if s.status == Status::WentUp {
-                "Scroll down to continue".to_string()
-            } else if s.status == Status::Lost {
-                "Lost track \u{2014} scroll back up a little".to_string()
-            } else if s.paused {
-                format!("Paused \u{00B7} {} px \u{00B7} hover the area to resume", group(s.rows))
-            } else if s.rows == 0 {
-                "Starting\u{2026}".to_string()
-            } else {
-                format!("Scrolling \u{00B7} {} px \u{00B7} Esc or Done to finish", group(s.rows))
+            let rows = group(s.cap.rows());
+            let msg = match s.cap.status() {
+                Status::Starting => "Starting\u{2026}".to_string(),
+                Status::Scrolling => format!("Scrolling \u{00B7} {rows} px \u{00B7} Esc or Done to finish"),
+                Status::Paused => format!("Paused \u{00B7} {rows} px \u{00B7} hover the area to resume"),
+                Status::WentUp => format!("Scroll down to continue \u{00B7} {rows} px"),
+                Status::Lost => "Lost track \u{00B7} scroll up a little, or click Done".to_string(),
             };
             let tr = rect(sc(32, dpi), 0, cancel.left - sc(8, dpi), rc.bottom);
             draw_text(back.dc, &msg, tr, s.font, argb(255, 235, 235, 242), DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
