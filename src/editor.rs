@@ -190,8 +190,11 @@ struct Editor {
     size: usize,
     dpi: u32,
     font: HFONT,
-    view: RECT,
-    scale: f32,
+    view: RECT,             // where the whole image is drawn (can run past the window when zoomed)
+    scale: f32,             // screen pixels per image pixel
+    fit: f32,               // scale that fits the window (never above 1)
+    mag: f32,               // Ctrl+wheel zoom on top of `fit` (1 = fit the window)
+    panning: Option<(i32, i32)>, // middle-button drag: last pointer position
     buttons: Vec<(Btn, RECT)>,
     bar_w: i32,
     hot: Option<usize>,
@@ -264,6 +267,9 @@ pub fn open(img: Image, saved: Option<std::path::PathBuf>) {
         font,
         view: RECT::default(),
         scale: 1.0,
+        fit: 1.0,
+        mag: 1.0,
+        panning: None,
         buttons,
         bar_w,
         hot: None,
@@ -331,7 +337,7 @@ fn stroke_width(st: &Editor, tool: Tool) -> f32 {
         Tool::Crop => base_width(tool),
         _ => base_width(tool) * SIZE_MULT[st.size],
     };
-    scf(w, st.dpi) / st.scale
+    scf(w, st.dpi) / st.fit
 }
 
 /// Smoothly anti-aliased font (no ClearType color fringes, since text gets baked into
@@ -728,6 +734,14 @@ fn draw_icon(g: &Graphics, t: Tool, cx: f32, cy: f32, dpi: u32, c: u32) {
 
 /// What the toolbar's hint area says: the hovered button, or how to use the current tool.
 fn hint(st: &Editor) -> String {
+    let h = hint_text(st);
+    if st.mag > 1.0 && st.note.is_none() && st.hot.is_none() {
+        return format!("{:.0}% \u{00B7} Ctrl+0 to fit \u{00B7} {h}", st.scale * 100.0);
+    }
+    h
+}
+
+fn hint_text(st: &Editor) -> String {
     if let Some(n) = &st.note {
         return n.clone();
     }
@@ -782,18 +796,13 @@ fn layout(hwnd: HWND, st: &mut Editor) {
     let bar = sc(BAR_H, dpi);
     let margin = sc(MARGIN, dpi);
 
-    // Fit image under the toolbar.
+    // Fit image under the toolbar, then apply any zoom, keeping the same spot centered.
     let aw = (rc.right - margin * 2).max(1) as f32;
     let ah = (rc.bottom - bar - margin * 2).max(1) as f32;
-    let s = (aw / st.base.w as f32).min(ah / st.base.h as f32).min(1.0).max(0.01);
-    let w = ((st.base.w as f32 * s).round() as i32).max(1);
-    let h = ((st.base.h as f32 * s).round() as i32).max(1);
-    let left = (rc.right - w) / 2;
-    let top = bar + margin + ((ah as i32 - h) / 2).max(0);
-    st.view = rect(left, top, left + w, top + h);
-    st.scale = if w == st.base.w && h == st.base.h { 1.0 } else { s };
-    rebuild_display(st);
-
+    st.fit = (aw / st.base.w as f32).min(ah / st.base.h as f32).min(1.0).max(0.01);
+    let center = ((rc.right / 2) as i32, ((bar + rc.bottom) / 2) as i32);
+    let keep = (st.view.right > st.view.left).then(|| (center, to_image_space(st, center.0, center.1)));
+    place_view(st, rc, keep);
     // Back buffer follows the client size.
     let need_back = match &st.back {
         Some(b) => b.w != rc.right || b.h != rc.bottom,
@@ -808,9 +817,75 @@ fn layout(hwnd: HWND, st: &mut Editor) {
     st.bar_w = bar_w;
 }
 
-/// Re-create the scaled display copy of `committed` (only needed when scaled down).
+/// Most an image pixel is blown up to.
+const MAX_SCALE: f32 = 16.0;
+
+/// Size and place the image for the current zoom. `anchor`: a screen point and the image
+/// point that should stay under it (the pointer when zooming); None centers the image.
+fn place_view(st: &mut Editor, rc: RECT, anchor: Option<((i32, i32), (f32, f32))>) {
+    let bar = sc(BAR_H, st.dpi);
+    let margin = sc(MARGIN, st.dpi);
+    let max_mag = (MAX_SCALE / st.fit).max(1.0);
+    st.mag = st.mag.clamp(1.0, max_mag);
+    let s = st.fit * st.mag;
+    let w = ((st.base.w as f32 * s).round() as i32).max(1);
+    let h = ((st.base.h as f32 * s).round() as i32).max(1);
+    st.scale = if w == st.base.w && h == st.base.h { 1.0 } else { s };
+    let (aw, ah) = (rc.right - margin * 2, rc.bottom - bar - margin * 2);
+    let (mut left, mut top) = match anchor {
+        Some(((sx, sy), (ix, iy))) => ((sx as f32 - ix * s).round() as i32, (sy as f32 - iy * s).round() as i32),
+        None => (0, 0),
+    };
+    // Fits: centered, as before. Bigger than the window: never leave a gap at an edge.
+    left = if w <= aw || anchor.is_none() && w <= rc.right { (rc.right - w) / 2 } else { left.clamp((rc.right - w).min(0), 0) };
+    top = if h <= ah || anchor.is_none() && h <= rc.bottom - bar {
+        bar + margin + ((ah - h) / 2).max(0)
+    } else {
+        top.clamp((rc.bottom - h).min(bar), bar)
+    };
+    st.view = rect(left, top, left + w, top + h);
+    rebuild_display(st);
+}
+
+/// Zoom by `factor` keeping the image point under (`sx`, `sy`) in place.
+fn zoom_at(hwnd: HWND, st: &mut Editor, factor: f32, sx: i32, sy: i32) {
+    if st.current.is_some() {
+        return; // not mid-stroke
+    }
+    end_text(hwnd, st, true, false);
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rc);
+    }
+    let (sx, sy) = if pt_in(&st.view, sx, sy) { (sx, sy) } else { (rc.right / 2, (sc(BAR_H, st.dpi) + rc.bottom) / 2) };
+    let at = to_image_space(st, sx, sy);
+    st.mag = if factor == 0.0 { 1.0 } else { st.mag * factor };
+    if (st.mag - 1.0).abs() < 0.02 {
+        st.mag = 1.0;
+    }
+    place_view(st, rc, (st.mag > 1.0).then_some(((sx, sy), at)));
+    invalidate_all(hwnd);
+}
+
+/// Move a zoomed-in image by (`dx`, `dy`) screen pixels.
+fn pan(hwnd: HWND, st: &mut Editor, dx: i32, dy: i32) {
+    if st.mag <= 1.0 || st.current.is_some() || (dx == 0 && dy == 0) {
+        return;
+    }
+    end_text(hwnd, st, true, false);
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rc);
+    }
+    let (sx, sy) = (st.view.left + dx, st.view.top + dy);
+    place_view(st, rc, Some(((sx, sy), (0.0, 0.0))));
+    invalidate_all(hwnd);
+}
+
+/// Re-create the scaled display copy of `committed` (only needed when scaled down to
+/// fit; zoomed views are drawn straight from `committed`, just the part that shows).
 fn rebuild_display(st: &mut Editor) {
-    if st.scale >= 1.0 {
+    if st.scale >= 1.0 || st.mag > 1.0 {
         st.display = None;
         return;
     }
@@ -1162,14 +1237,36 @@ fn paint(hwnd: HWND, st: &mut Editor) {
         }
 
         // Image (from the pre-scaled copy) and anything in progress.
-        if let Some(i) = intersect(rc, st.view) {
-            let src = st.display.as_ref().unwrap_or(&st.committed);
-            let _ = BitBlt(
-                back.dc, i.left, i.top, rect_w(&i), rect_h(&i),
-                Some(src.dc), i.left - st.view.left, i.top - st.view.top, SRCCOPY,
-            );
+        let below_bar = rect(0, bar.bottom, rc.right.max(bar.right), rc.bottom.max(st.view.bottom));
+        if let Some(i) = intersect(rc, st.view).and_then(|i| intersect(i, below_bar)) {
             let saved = SaveDC(back.dc);
             let _ = IntersectClipRect(back.dc, i.left, i.top, i.right, i.bottom);
+            if st.display.is_some() || st.scale == 1.0 {
+                let src = st.display.as_ref().unwrap_or(&st.committed);
+                let _ = BitBlt(
+                    back.dc, i.left, i.top, rect_w(&i), rect_h(&i),
+                    Some(src.dc), i.left - st.view.left, i.top - st.view.top, SRCCOPY,
+                );
+            } else {
+                // Zoomed: stretch just the image pixels that show. Blown up, they stay
+                // crisp squares, which is what you want for detail work.
+                let s = st.scale;
+                let (cw, ch) = (st.committed.w, st.committed.h);
+                let sx0 = (((i.left - st.view.left) as f32 / s).floor() as i32).clamp(0, cw);
+                let sy0 = (((i.top - st.view.top) as f32 / s).floor() as i32).clamp(0, ch);
+                let sx1 = (((i.right - st.view.left) as f32 / s).ceil() as i32).clamp(sx0, cw);
+                let sy1 = (((i.bottom - st.view.top) as f32 / s).ceil() as i32).clamp(sy0, ch);
+                let dx0 = st.view.left + (sx0 as f32 * s).round() as i32;
+                let dy0 = st.view.top + (sy0 as f32 * s).round() as i32;
+                let dx1 = st.view.left + (sx1 as f32 * s).round() as i32;
+                let dy1 = st.view.top + (sy1 as f32 * s).round() as i32;
+                SetStretchBltMode(back.dc, if s >= 1.0 { COLORONCOLOR } else { HALFTONE });
+                let _ = SetBrushOrgEx(back.dc, 0, 0, None);
+                let _ = StretchBlt(
+                    back.dc, dx0, dy0, dx1 - dx0, dy1 - dy0,
+                    Some(st.committed.dc), sx0, sy0, sx1 - sx0, sy1 - sy0, SRCCOPY,
+                );
+            }
             if let Some(s) = &st.current {
                 draw_preview(back.dc, st, s);
             }
@@ -1359,7 +1456,7 @@ fn end_text(hwnd: HWND, st: &mut Editor, keep: bool, refocus: bool) {
                     tool: Tool::Text,
                     color: entry.color,
                     // Same pixel size as the text box.
-                    width: sc(TEXT_PX[st.size], st.dpi) as f32 / st.scale,
+                    width: sc(TEXT_PX[st.size], st.dpi) as f32 / st.fit,
                     pts: vec![entry.at],
                     text,
                 };
@@ -1495,7 +1592,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 let (x, y) = cursor_pos();
                 let mut p = POINT { x, y };
                 let _ = ScreenToClient(hwnd, &mut p);
-                let c = if pt_in(&st.view, p.x, p.y) {
+                let c = if st.panning.is_some() {
+                    IDC_SIZEALL
+                } else if p.y >= sc(BAR_H, st.dpi) && pt_in(&st.view, p.x, p.y) {
                     match st.tool {
                         Tool::Text => IDC_IBEAM,
                         _ if st.zoom.is_some() => IDC_HAND,
@@ -1571,6 +1670,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_MOUSEMOVE => {
             let (x, y) = lparam_point(lp);
+            if let Some((px, py)) = st.panning {
+                st.panning = Some((x, y));
+                pan(hwnd, st, x - px, y - py);
+                return LRESULT(0);
+            }
             let hot = st.buttons.iter().position(|(_, r)| pt_in(r, x, y));
             if hot != st.hot {
                 st.hot = hot;
@@ -1649,8 +1753,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             finish_stroke(hwnd, st);
             LRESULT(0)
         }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            let notches = ((wp.0 >> 16) as u16 as i16) as f32 / WHEEL_DELTA as f32;
+            let (x, y) = lparam_point(lp);
+            let mut p = POINT { x, y }; // wheel messages carry screen coordinates
+            let _ = ScreenToClient(hwnd, &mut p);
+            let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
+            let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
+            if ctrl && msg == WM_MOUSEWHEEL {
+                zoom_at(hwnd, st, 1.25f32.powf(notches), p.x, p.y);
+            } else {
+                // Zoomed in: the wheel moves around (Shift or a tilt wheel: sideways).
+                let step = (notches * sc(120, st.dpi) as f32).round() as i32;
+                if msg == WM_MOUSEHWHEEL {
+                    pan(hwnd, st, -step, 0);
+                } else if shift {
+                    pan(hwnd, st, step, 0);
+                } else {
+                    pan(hwnd, st, 0, step);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_MBUTTONDOWN => {
+            if st.mag > 1.0 && st.current.is_none() {
+                st.panning = Some(lparam_point(lp));
+                SetCapture(hwnd);
+                SetCursor(LoadCursorW(None, IDC_SIZEALL).ok());
+            }
+            LRESULT(0)
+        }
+        WM_MBUTTONUP => {
+            if st.panning.take().is_some() {
+                let _ = ReleaseCapture();
+            }
+            LRESULT(0)
+        }
         WM_RBUTTONUP => {
             cancel_zoom(hwnd, st);
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED if st.panning.is_some() && HWND(lp.0 as *mut _) != hwnd => {
+            st.panning = None;
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
@@ -1672,9 +1816,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 return LRESULT(0);
             }
             if ctrl {
+                let mid = (-1, -1); // zoom around the middle of the window
                 match key {
                     VK_Z => undo(hwnd, st),
                     VK_C => copy_now(hwnd, st),
+                    VK_0 | VK_NUMPAD0 => zoom_at(hwnd, st, 0.0, mid.0, mid.1),
+                    VK_OEM_PLUS | VK_ADD => zoom_at(hwnd, st, 1.25, mid.0, mid.1),
+                    VK_OEM_MINUS | VK_SUBTRACT => zoom_at(hwnd, st, 0.8, mid.0, mid.1),
                     _ => {}
                 }
                 return LRESULT(0);

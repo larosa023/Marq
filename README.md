@@ -53,6 +53,8 @@ The snip is copied to the clipboard immediately and saved as a PNG to **Pictures
 
 Colors **1–5**, thickness **[** and **]** (or the dot button), Undo **Ctrl+Z** (undoes crops too), close **Esc**. Your marked-up image is re-copied to the clipboard automatically a moment after each change, and again when you close the window.
 
+**Zoom in for detail work:** hold **Ctrl** and turn the scroll wheel; it zooms toward the pointer (up to 16× so single pixels are easy to hit). While zoomed, the wheel scrolls up and down, **Shift**+wheel scrolls sideways, and dragging with the **middle button** moves around. **Ctrl+0** fits the whole image again (**Ctrl+=** / **Ctrl+−** zoom from the keyboard). Pen, arrows and text keep the same thickness whatever the zoom, so marks stay consistent.
+
 ## Updates
 
 Marq checks GitHub for new versions shortly after starting and every few hours. When one is out, you get a notification. Click it, or right-click the tray icon and choose **Update to vX**. Marq downloads the new version, verifies it, swaps itself and restarts. You never need to download a new exe by hand.
