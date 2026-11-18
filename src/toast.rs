@@ -22,6 +22,8 @@ thread_local! {
 
 struct Toast {
     copied: bool,
+    /// Text card: a color that was copied, shown as a swatch (title becomes "Color copied").
+    swatch: Option<u32>,
     saved: Option<std::path::PathBuf>, // where the snip was saved, if it was
     img: Option<Image>,  // handed to the editor on click
     thumb: Option<Dib>,  // pre-scaled once, so painting is a plain blit (None for text cards)
@@ -93,6 +95,7 @@ pub fn show(img: Image, near: RECT, copied: bool, saved: Option<std::path::PathB
 
     let st = Box::new(Toast {
         copied,
+        swatch: None,
         saved,
         img: Some(img),
         thumb: Some(thumb),
@@ -109,6 +112,23 @@ pub fn show(img: Image, near: RECT, copied: bool, saved: Option<std::path::PathB
 }
 
 /// "Text copied" card with a short preview, or the reason nothing was copied.
+/// "Color copied" card: the hex code, its RGB values and a swatch.
+pub fn show_color(color: u32, copied: bool, near: RECT) {
+    let (r, g, b) = ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
+    let text = format!("#{color:06X}\nRGB {r}, {g}, {b}");
+    let result = if copied { Ok(text) } else { Err("Couldn't reach the clipboard.".to_string()) };
+    show_text(&result, near);
+    let hwnd = CURRENT.with(|c| c.get());
+    if let Some(st) = unsafe { get_state::<Toast>(hwnd) } {
+        if copied {
+            st.swatch = Some(color);
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            }
+        }
+    }
+}
+
 pub fn show_text(result: &Result<String, String>, near: RECT) {
     close_current();
     let cx = (near.left + near.right) / 2;
@@ -130,6 +150,7 @@ pub fn show_text(result: &Result<String, String>, near: RECT) {
     let y = work.bottom - h - sc(16, dpi);
     let st = Box::new(Toast {
         copied,
+        swatch: None,
         saved: None,
         img: None,
         thumb: None,
@@ -188,8 +209,19 @@ fn paint(hwnd: HWND, st: &mut Toast) {
                 g.fill_ellipse(scf(18.0, dpi), scf(25.0, dpi), scf(4.0, dpi), dot);
             }
             let tx = sc(30, dpi);
+            if let (Some(c), Some(g)) = (st.swatch, Graphics::from_hdc(back.dc)) {
+                let sw = scf(40.0, dpi);
+                let (x, y) = (rc.right as f32 - sw - scf(14.0, dpi), (rc.bottom as f32 - sw) / 2.0);
+                g.fill_round_rect(x, y, sw, sw, scf(8.0, dpi), c | 0xFF00_0000);
+                g.stroke_round_rect(x, y, sw, sw, scf(8.0, dpi), 1.0, argb(90, 255, 255, 255));
+            }
+            let title = match (st.copied, st.swatch.is_some()) {
+                (true, true) => "Color copied",
+                (true, false) => "Text copied",
+                (false, _) => "Couldn't copy text",
+            };
             draw_text(
-                back.dc, if st.copied { "Text copied" } else { "Couldn't copy text" },
+                back.dc, title,
                 rect(tx, sc(14, dpi), rc.right - sc(12, dpi), sc(36, dpi)),
                 st.font_b, argb(255, 245, 245, 250), DT_LEFT | DT_VCENTER | DT_SINGLELINE,
             );

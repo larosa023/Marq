@@ -60,11 +60,12 @@ enum Tool {
     Measure,
     Zoom,
     Blur,
+    Redact,
     Crop,
 }
 
 /// Toolbar order, name, and shortcut key.
-const TOOLS: [(Tool, &str, char); 12] = [
+const TOOLS: [(Tool, &str, char); 13] = [
     (Tool::Pen, "Pen", 'P'),
     (Tool::Highlighter, "Marker", 'H'),
     (Tool::Arrow, "Arrow", 'A'),
@@ -76,13 +77,14 @@ const TOOLS: [(Tool, &str, char); 12] = [
     (Tool::Measure, "Measure", 'M'),
     (Tool::Zoom, "Zoom", 'Z'),
     (Tool::Blur, "Blur", 'B'),
+    (Tool::Redact, "Redact", 'X'),
     (Tool::Crop, "Crop", 'C'),
 ];
 
 impl Tool {
     /// Tools you drag corner-to-corner (or end-to-end).
     fn two_point(self) -> bool {
-        matches!(self, Tool::Rect | Tool::Ellipse | Tool::Measure | Tool::Zoom | Tool::Blur | Tool::Crop)
+        matches!(self, Tool::Rect | Tool::Ellipse | Tool::Measure | Tool::Zoom | Tool::Blur | Tool::Redact | Tool::Crop)
     }
 
     fn name(self) -> &'static str {
@@ -117,7 +119,7 @@ impl Stroke {
         match self.tool {
             Tool::Arrow | Tool::Curve => self.width * 4.0 + 2.0,
             Tool::Measure => self.width * 8.0 + 30.0, // end ticks + label
-            Tool::Blur | Tool::Crop | Tool::Zoom => 3.0,
+            Tool::Blur | Tool::Redact | Tool::Crop | Tool::Zoom => 3.0,
             _ => self.width / 2.0 + 2.0,
         }
     }
@@ -327,6 +329,7 @@ fn base_width(tool: Tool) -> f32 {
         Tool::Text => TEXT_PX[1] as f32,
         Tool::Zoom => 3.0,
         Tool::Blur => 12.0, // mosaic block size
+        Tool::Redact => 1.0,
         Tool::Crop => 1.5,
     }
 }
@@ -469,6 +472,17 @@ fn render(dc: HDC, s: &Stroke, m: Map) {
             gdi_text(dc, &s.text, r, px, 700, ink_on(s.color), DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOCLIP);
         }
         Tool::Measure => render_measure(dc, s, m),
+        Tool::Redact => {
+            // Solid black out to whole pixels: no soft edge with anything showing through.
+            let (x0, y0, x1, y1) = s.bounds();
+            let (a, b) = (m.p((x0.floor(), y0.floor())), m.p((x1.ceil(), y1.ceil())));
+            let r = rect(a.0.floor() as i32, a.1.floor() as i32, b.0.ceil() as i32, b.1.ceil() as i32);
+            unsafe {
+                let brush = CreateSolidBrush(COLORREF(0));
+                FillRect(dc, &r, brush);
+                let _ = DeleteObject(brush.into());
+            }
+        }
         Tool::Zoom | Tool::Blur | Tool::Crop => {}
     }
 }
@@ -725,6 +739,11 @@ fn draw_icon(g: &Graphics, t: Tool, cx: f32, cy: f32, dpi: u32, c: u32) {
                 }
             }
         }
+        Tool::Redact => {
+            g.line(cx - u(8.0), cy - u(5.5), cx + u(8.0), cy - u(5.5), u(1.4), c);
+            g.fill_round_rect(cx - u(8.0), cy - u(2.5), u(16.0), u(5.0), u(1.0), c);
+            g.line(cx - u(8.0), cy + u(5.5), cx + u(3.0), cy + u(5.5), u(1.4), c);
+        }
         Tool::Crop => {
             g.polyline(&[(cx - u(4.0), cy - u(8.0)), (cx - u(4.0), cy + u(4.0)), (cx + u(8.0), cy + u(4.0))], lw, c, false);
             g.polyline(&[(cx - u(8.0), cy - u(4.0)), (cx + u(4.0), cy - u(4.0)), (cx + u(4.0), cy + u(8.0))], lw, c, false);
@@ -770,6 +789,7 @@ fn hint_text(st: &Editor) -> String {
         Tool::Measure => "Shift = straight \u{00B7} click Measure again to reset the scale".into(),
         Tool::Zoom => "Drag around a small detail to magnify it".into(),
         Tool::Blur => "Drag over anything private".into(),
+        Tool::Redact => "Drag to black out prices, names, anything private".into(),
         Tool::Crop => "Drag the area to keep".into(),
         _ => String::new(),
     }

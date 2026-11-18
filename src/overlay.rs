@@ -19,6 +19,7 @@ pub enum Mode {
     Screen,
     Text,   // drag like Region, but copy the text inside instead of the picture
     Scroll, // drag an area, then scroll; the frames are stitched into one tall image
+    Color,  // click a pixel to copy its color
 }
 
 impl Mode {
@@ -30,6 +31,10 @@ impl Mode {
 
 const CLASS: &str = "MarqOverlay";
 const ACCENT: u32 = argb(255, 0x8B, 0x6F, 0xFF);
+/// Toolbar buttons; the last two are the settings gear and close, drawn as icons.
+const LABELS: [&str; 8] = ["Region", "Window", "Screen", "Text", "Scroll", "Color", "", ""];
+const GEAR: usize = 6;
+const CLOSE: usize = 7;
 
 thread_local! {
     static OPEN: Cell<bool> = const { Cell::new(false) };
@@ -47,7 +52,7 @@ struct Overlay {
     cur: (i32, i32),
     hover: Option<RECT>,
     toolbar: RECT,
-    buttons: [RECT; 7], // Region, Window, Screen, Text, Scroll, Settings, Close
+    buttons: [RECT; 8], // Region, Window, Screen, Text, Scroll, Color, Settings, Close
     hot: Option<usize>,
     pressed: Option<usize>, // toolbar button under mouse-down
     armed: bool,            // window/screen click started on the overlay
@@ -129,7 +134,7 @@ pub fn start(mode: Mode) {
         cur: (cx - ox, cy - oy),
         hover: None,
         toolbar: RECT::default(),
-        buttons: [RECT::default(); 7],
+        buttons: [RECT::default(); 8],
         hot: None,
         pressed: None,
         armed: false,
@@ -172,7 +177,7 @@ pub fn start(mode: Mode) {
 }
 
 fn layout_toolbar(st: &mut Overlay, mon: RECT) {
-    let labels = ["Region", "Window", "Screen", "Text", "Scroll", "", ""];
+    let labels = LABELS;
     let dpi = st.dpi;
     let pad = sc(14, dpi);
     let gap = sc(4, dpi);
@@ -183,18 +188,18 @@ fn layout_toolbar(st: &mut Overlay, mon: RECT) {
         let ws = labels
             .iter()
             .enumerate()
-            .map(|(i, l)| if i >= 5 { sc(32, dpi) } else { text_width(dc, l, st.font) + pad * 2 })
+            .map(|(i, l)| if i >= GEAR { sc(32, dpi) } else { text_width(dc, l, st.font) + pad * 2 })
             .collect();
         ReleaseDC(None, dc);
         ws
     };
-    let total: i32 = widths.iter().sum::<i32>() + gap * 6 + inner * 2 + sc(8, dpi);
+    let total: i32 = widths.iter().sum::<i32>() + gap * (LABELS.len() as i32 - 1) + inner * 2 + sc(8, dpi);
     let left = mon.left + (mon.right - mon.left - total) / 2;
     let top = mon.top + sc(18, dpi);
     st.toolbar = rect(left, top, left + total, top + h);
     let mut x = left + inner;
     for (i, w) in widths.iter().enumerate() {
-        if i == 5 {
+        if i == GEAR {
             x += sc(8, dpi); // small separator before settings + close
         }
         st.buttons[i] = rect(x, top + inner, x + w, top + h - inner);
@@ -221,7 +226,7 @@ impl Overlay {
     fn update_hover(&mut self) {
         let (x, y) = self.cur;
         self.hover = match self.mode {
-            Mode::Region | Mode::Text | Mode::Scroll => None,
+            Mode::Region | Mode::Text | Mode::Scroll | Mode::Color => None,
             Mode::Window => self
                 .windows
                 .iter()
@@ -241,7 +246,8 @@ impl Overlay {
     /// Where the magnifier is drawn right now (loupe + coordinate strip), if shown.
     fn loupe_rect(&self) -> Option<RECT> {
         let (x, y) = self.cur;
-        if !self.magnifier || !self.mode.drags() || pt_in(&self.toolbar, x, y) {
+        let wanted = self.mode == Mode::Color || self.magnifier && self.mode.drags();
+        if !wanted || pt_in(&self.toolbar, x, y) {
             return None;
         }
         let (fw, fh) = self.loupe_size();
@@ -266,7 +272,8 @@ impl Overlay {
     fn loupe_size(&self) -> (i32, i32) {
         let (cell, n) = self.loupe_cell();
         let size = cell * n;
-        (size.max(sc(156, self.dpi)), size + sc(24, self.dpi))
+        let min_w = if self.mode == Mode::Color { 190 } else { 156 }; // room for "#FFFFFF 255, 255, 255"
+        (size.max(sc(min_w, self.dpi)), size + sc(24, self.dpi))
     }
 
     fn clamp(&self, r: RECT) -> RECT {
@@ -403,6 +410,22 @@ fn finish(hwnd: HWND, sel: RECT) {
     }
 }
 
+/// Copy the color under the pointer as #RRGGBB, close, and say so.
+fn pick_color(hwnd: HWND, st: &Overlay) {
+    let (x, y) = st.cur;
+    let (w, h) = (st.frozen.dib.w, st.frozen.dib.h);
+    if x < 0 || y < 0 || x >= w || y >= h {
+        return;
+    }
+    let c = st.frozen.dib.pixels_mut()[(y * w + x) as usize] & 0x00FF_FFFF;
+    let (ox, oy) = st.frozen.origin;
+    let near = rect(x + ox, y + oy, x + ox + 1, y + oy + 1);
+    unsafe {
+        let _ = DestroyWindow(hwnd);
+    }
+    crate::on_color(c, near);
+}
+
 fn cancel(hwnd: HWND) {
     unsafe {
         let _ = DestroyWindow(hwnd);
@@ -515,6 +538,7 @@ fn compose(st: &Overlay, rc: RECT) {
                 Mode::Screen => 2,
                 Mode::Text => 3,
                 Mode::Scroll => 4,
+                Mode::Color => 5,
             };
             if let Some(g) = Graphics::from_hdc(back) {
                 g.clip(rc.left, rc.top, w, h);
@@ -557,20 +581,19 @@ fn compose(st: &Overlay, rc: RECT) {
                     }
                 }
             }
-            let labels = ["Region", "Window", "Screen", "Text", "Scroll"];
-            for (i, b) in st.buttons.iter().take(5).enumerate() {
+            for (i, b) in st.buttons.iter().take(GEAR).enumerate() {
                 let c = if i == active { argb(255, 255, 255, 255) } else { argb(255, 200, 200, 210) };
-                draw_text(back, labels[i], *b, st.font, c, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                draw_text(back, LABELS[i], *b, st.font, c, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             }
             // Settings gear and close X: drawn shapes, no font dependency.
             if let Some(g) = Graphics::from_hdc(back) {
                 g.clip(rc.left, rc.top, w, h);
                 let icon = |i: usize| if st.hot == Some(i) { argb(255, 255, 255, 255) } else { argb(255, 200, 200, 210) };
 
-                let b = st.buttons[5];
+                let b = st.buttons[GEAR];
                 let cx = (b.left + b.right) as f32 / 2.0;
                 let cy = (b.top + b.bottom) as f32 / 2.0;
-                let c = icon(5);
+                let c = icon(GEAR);
                 let ring = scf(4.6, dpi);
                 g.stroke_ellipse(cx, cy, ring, scf(2.4, dpi), c);
                 for k in 0..8 {
@@ -583,11 +606,11 @@ fn compose(st: &Overlay, rc: RECT) {
                     );
                 }
 
-                let b = st.buttons[6];
+                let b = st.buttons[CLOSE];
                 let cx = (b.left + b.right) as f32 / 2.0;
                 let cy = (b.top + b.bottom) as f32 / 2.0;
                 let k = scf(5.0, dpi);
-                let c = icon(6);
+                let c = icon(CLOSE);
                 g.line(cx - k, cy - k, cx + k, cy + k, scf(1.6, dpi), c);
                 g.line(cx - k, cy + k, cx + k, cy - k, scf(1.6, dpi), c);
             }
@@ -653,12 +676,28 @@ fn draw_loupe(st: &Overlay, lr: RECT, rc: RECT) {
         } else {
             0
         };
-        let txt = format!("{}, {}  #{:06X}", cx + ox, cy + oy, color);
-        draw_text(
-            back, &txt,
-            rect(lr.left, lr.top + size, lr.right, lr.bottom),
-            st.font_small, argb(255, 225, 225, 232), DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-        );
+        let strip = rect(lr.left, lr.top + size, lr.right, lr.bottom);
+        if st.mode == Mode::Color {
+            // Swatch, hex and RGB: what a click copies.
+            let (r, g_, b) = ((color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF);
+            let sw = sc(12, dpi);
+            let sx = strip.left + sc(8, dpi);
+            let sy = (strip.top + strip.bottom - sw) / 2;
+            if let Some(g) = Graphics::from_hdc(back) {
+                g.clip(rc.left, rc.top, rect_w(&rc), rect_h(&rc));
+                g.fill_round_rect(sx as f32, sy as f32, sw as f32, sw as f32, scf(3.0, dpi), color | 0xFF00_0000);
+                g.stroke_round_rect(sx as f32, sy as f32, sw as f32, sw as f32, scf(3.0, dpi), 1.0, argb(140, 255, 255, 255));
+            }
+            let txt = format!("#{:06X}  {r}, {g_}, {b}", color);
+            draw_text(
+                back, &txt,
+                rect(sx + sw + sc(6, dpi), strip.top, strip.right - sc(4, dpi), strip.bottom),
+                st.font_small, argb(255, 235, 235, 240), DT_LEFT | DT_VCENTER | DT_SINGLELINE,
+            );
+        } else {
+            let txt = format!("{}, {}  #{:06X}", cx + ox, cy + oy, color);
+            draw_text(back, &txt, strip, st.font_small, argb(255, 225, 225, 232), DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
     }
 }
 
@@ -666,7 +705,7 @@ fn update_cursor(st: &Overlay) {
     let (x, y) = st.cur;
     let c = if pt_in(&st.toolbar, x, y) {
         IDC_HAND
-    } else if st.mode.drags() {
+    } else if st.mode.drags() || st.mode == Mode::Color {
         IDC_CROSS
     } else {
         IDC_HAND
@@ -716,7 +755,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if new_sel != old_sel {
                 invalidate_change(hwnd, st, old_sel, new_sel);
             }
-            if st.magnifier {
+            if st.magnifier || st.mode == Mode::Color {
                 refresh_loupe(hwnd, st);
             }
             LRESULT(0)
@@ -752,7 +791,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                         2 => set_mode(hwnd, st, Mode::Screen),
                         3 => set_mode(hwnd, st, Mode::Text),
                         4 => set_mode(hwnd, st, Mode::Scroll),
-                        5 => {
+                        5 => set_mode(hwnd, st, Mode::Color),
+                        GEAR => {
                             cancel(hwnd);
                             crate::settings_ui::open();
                         }
@@ -775,7 +815,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             } else if st.armed {
                 st.armed = false;
-                if let Some(sel) = st.hover {
+                if st.mode == Mode::Color {
+                    pick_color(hwnd, st);
+                } else if let Some(sel) = st.hover {
                     finish(hwnd, sel);
                 }
             }
@@ -803,10 +845,24 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 VK_3 | VK_S | VK_F => set_mode(hwnd, st, Mode::Screen),
                 VK_4 | VK_T => set_mode(hwnd, st, Mode::Text),
                 VK_5 | VK_L => set_mode(hwnd, st, Mode::Scroll),
+                VK_6 | VK_C => set_mode(hwnd, st, Mode::Color),
                 VK_RETURN | VK_SPACE => {
-                    if let Some(sel) = st.hover {
+                    if st.mode == Mode::Color {
+                        pick_color(hwnd, st);
+                    } else if let Some(sel) = st.hover {
                         finish(hwnd, sel);
                     }
+                }
+                // Arrow keys nudge the pointer one pixel, for hitting an exact pixel.
+                VK_LEFT | VK_RIGHT | VK_UP | VK_DOWN if !st.dragging => {
+                    let (dx, dy) = match key {
+                        VK_LEFT => (-1, 0),
+                        VK_RIGHT => (1, 0),
+                        VK_UP => (0, -1),
+                        _ => (0, 1),
+                    };
+                    let (x, y) = cursor_pos();
+                    let _ = SetCursorPos(x + dx, y + dy);
                 }
                 _ => {}
             }

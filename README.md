@@ -19,6 +19,7 @@ A hyper-lightweight screen snipping tool for Windows. It lives in the system tra
 | Full screen | Press **S** (or click *Screen*), then click a monitor |
 | Copy text | Press **T** (or click *Text*), then drag over text; the text is copied instead of the picture |
 | Scrolling capture | Press **L** (or click *Scroll*) and drag the area; Marq scrolls it for you. **Esc** or **Done** finishes early |
+| Pick a color | Press **C** (or click *Color*), then click any pixel; its hex code (like `#22AA66`) is copied. Arrow keys nudge one pixel |
 | Settings | Click the **gear** in the snip toolbar, or right-click the tray icon → *Settings* |
 | Cancel | **Esc** or right-click |
 
@@ -49,9 +50,12 @@ The snip is copied to the clipboard immediately and saved as a PNG to **Pictures
 | Measure | **M** | Draw along something of known length and type its real length (e.g. `20' 6"` or `5 m`); every line after that shows real lengths. Click Measure again to reset the scale |
 | Zoom | **Z** | Drag around a small detail, then click where the 2× magnified copy should go |
 | Blur | **B** | Drag over anything private |
+| Redact | **X** | Drag to black out prices, names or numbers with a solid box (nothing shows through, unlike blur) |
 | Crop | **C** | Drag the area to keep |
 
 Colors **1–5**, thickness **[** and **]** (or the dot button), Undo **Ctrl+Z** (undoes crops too), close **Esc**. Your marked-up image is re-copied to the clipboard automatically a moment after each change, and again when you close the window.
+
+**Edit any picture:** right-click an image in File Explorer and choose **Edit with Marq** (on Windows 11 it's under *Show more options*). Your markup is copied to the clipboard and saved next to the original as *name (Marq).png*; the original is never changed. Turn the menu entry off in Settings if you don't want it.
 
 **Zoom in for detail work:** hold **Ctrl** and turn the scroll wheel; it zooms toward the pointer (up to 16× so single pixels are easy to hit). While zoomed, the wheel scrolls up and down, **Shift**+wheel scrolls sideways, and dragging with the **middle button** moves around. **Ctrl+0** fits the whole image again (**Ctrl+=** / **Ctrl+−** zoom from the keyboard). Pen, arrows and text keep the same thickness whatever the zoom, so marks stay consistent.
 

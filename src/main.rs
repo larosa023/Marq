@@ -26,6 +26,7 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::Win32::Foundation::*;
+use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::Threading::*;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -44,6 +45,14 @@ const WM_APP_SNIP: u32 = WM_APP + 2; // from a second instance; wParam = mode
 const WM_APP_UPDATER: u32 = WM_APP + 3; // updater::take_events() has results
 const WM_APP_SNIP_KEY: u32 = WM_APP + 4; // the snip shortcut was pressed (hook thread)
 const WM_APP_OCR: u32 = WM_APP + 5; // ocr::take_results() has results
+/// WM_COPYDATA tag: a second instance asking us to open this image in the editor.
+const COPYDATA_EDIT: usize = 0x4D45; // "ME"
+
+thread_local! {
+    /// Files handed over by "Edit with Marq", opened once the sender has let go.
+    static TO_EDIT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+const WM_APP_EDIT: u32 = WM_APP + 6;
 
 // NIN_SELECT | NINF_KEY (not exported by the bindings).
 const NIN_KEYSELECT: u32 = NIN_SELECT | 0x1;
@@ -114,6 +123,30 @@ pub fn on_snip(img: Image, screen_rect: RECT) {
 }
 
 /// Called by the overlay in Text mode: read the text in the area, copy it.
+/// Open a picture in the editor. Markup is copied to the clipboard as usual and saved
+/// next to the original as "<name> (Marq).png"; the original is never changed.
+fn edit_file(path: &str) {
+    let Some(img) = gallery::load(path) else { return };
+    let src = std::path::Path::new(path);
+    let saved = src.parent().zip(src.file_stem()).map(|(dir, stem)| {
+        let stem = stem.to_string_lossy();
+        let mut p = dir.join(format!("{stem} (Marq).png"));
+        let mut n = 2;
+        while p.exists() {
+            p = dir.join(format!("{stem} (Marq {n}).png"));
+            n += 1;
+        }
+        p
+    });
+    editor::open(img, saved);
+}
+
+/// Called by the overlay's color picker: copy the color as #RRGGBB.
+pub fn on_color(color: u32, near: RECT) {
+    let ok = copy_text_to_clipboard(host(), &format!("#{color:06X}"));
+    toast::show_color(color, ok, near);
+}
+
 pub fn on_text(img: Image, screen_rect: RECT) {
     ocr::recognize_async(img, screen_rect, host(), WM_APP_OCR);
 }
@@ -122,6 +155,8 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let updated = args.iter().any(|a| a == "--updated");
     let autostarted = args.iter().any(|a| a == "--autostart");
+    // `Marq.exe --edit <image>` (File Explorer's "Edit with Marq") opens a picture in the editor.
+    let edit = args.iter().position(|a| a == "--edit").and_then(|i| args.get(i + 1)).cloned();
 
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -138,7 +173,24 @@ fn main() {
                 let mut pid = 0u32;
                 GetWindowThreadProcessId(other, Some(&mut pid));
                 let _ = AllowSetForegroundWindow(pid);
-                let _ = PostMessageW(Some(other), WM_APP_SNIP, WPARAM(0), LPARAM(0));
+                match &edit {
+                    // Hand the file to the running copy.
+                    Some(path) => {
+                        let w: Vec<u16> = path.encode_utf16().collect();
+                        let cds = COPYDATASTRUCT {
+                            dwData: COPYDATA_EDIT,
+                            cbData: (w.len() * 2) as u32,
+                            lpData: w.as_ptr() as *mut _,
+                        };
+                        let _ = SendMessageTimeoutW(
+                            other, WM_COPYDATA, WPARAM(0), LPARAM(&cds as *const _ as isize),
+                            SMTO_ABORTIFHUNG, 5_000, None,
+                        );
+                    }
+                    None => {
+                        let _ = PostMessageW(Some(other), WM_APP_SNIP, WPARAM(0), LPARAM(0));
+                    }
+                }
             }
             return;
         }
@@ -185,10 +237,11 @@ fn main() {
         }
         updater::cleanup_old();
         settings::refresh_autostart_path();
+        settings::apply_explorer_menu();
 
         if updated {
             balloon(hwnd, "Marq updated", &format!("You're now on v{}.", updater::CURRENT), Balloon::None);
-        } else if !autostarted {
+        } else if !autostarted && edit.is_none() {
             let hk = APP.with(|a| a.borrow().hotkey_label.clone());
             balloon(
                 hwnd,
@@ -198,11 +251,8 @@ fn main() {
             );
         }
 
-        // `Marq.exe --edit <image>` opens an existing picture straight in the markup editor.
-        if let Some(i) = args.iter().position(|a| a == "--edit") {
-            if let Some(img) = args.get(i + 1).and_then(|p| gallery::load(p)) {
-                editor::open(img, None);
-            }
+        if let Some(path) = &edit {
+            edit_file(path);
         }
 
         SetTimer(Some(hwnd), TIMER_UPDATE_FIRST, FIRST_CHECK_MS, None);
@@ -518,6 +568,22 @@ unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         }
         WM_APP_SNIP => {
             snip_soon(hwnd, Mode::Region, 50);
+            LRESULT(0)
+        }
+        WM_COPYDATA => {
+            let cds = &*(lp.0 as *const COPYDATASTRUCT);
+            if cds.dwData != COPYDATA_EDIT || cds.lpData.is_null() || cds.cbData > 64 * 1024 {
+                return LRESULT(0);
+            }
+            let w = std::slice::from_raw_parts(cds.lpData as *const u16, cds.cbData as usize / 2);
+            TO_EDIT.with(|t| t.borrow_mut().push(String::from_utf16_lossy(w)));
+            let _ = PostMessageW(Some(hwnd), WM_APP_EDIT, WPARAM(0), LPARAM(0));
+            LRESULT(1)
+        }
+        WM_APP_EDIT => {
+            for path in TO_EDIT.with(|t| std::mem::take(&mut *t.borrow_mut())) {
+                edit_file(&path);
+            }
             LRESULT(0)
         }
         WM_TIMER => {

@@ -163,3 +163,57 @@ pub fn save_hotkey(mods: u32, vk: u32) {
         }
     }
 }
+
+/// File Explorer's right-click "Edit with Marq" on pictures (per user, no admin).
+const MENU_KEY: &str = "Software\\Classes\\SystemFileAssociations\\image\\shell\\MarqEdit";
+
+/// Whether "Edit with Marq" should be in File Explorer. On by default.
+pub fn explorer_menu() -> bool {
+    read_dword("ExplorerMenu").map_or(true, |v| v != 0)
+}
+
+pub fn set_explorer_menu(on: bool) {
+    if let Some(hkey) = open_app_key() {
+        write_dword(hkey, "ExplorerMenu", on as u32);
+        unsafe {
+            let _ = RegCloseKey(hkey);
+        }
+    }
+    apply_explorer_menu();
+}
+
+/// Add (pointing at this exe, in case it moved) or remove the menu entry, per the setting.
+pub fn apply_explorer_menu() {
+    let key = WStr::new(MENU_KEY);
+    unsafe {
+        if !explorer_menu() {
+            let _ = RegDeleteTreeW(HKEY_CURRENT_USER, key.p());
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else { return };
+        let exe = exe.display().to_string();
+        let set = |sub: &str, name: Option<&str>, value: &str| {
+            let path = WStr::new(&if sub.is_empty() { MENU_KEY.to_string() } else { format!("{MENU_KEY}\\{sub}") });
+            let mut hkey = HKEY::default();
+            if RegCreateKeyExW(
+                HKEY_CURRENT_USER, path.p(), Some(0), None, REG_OPTION_NON_VOLATILE,
+                KEY_WRITE, None, &mut hkey, None,
+            )
+            .is_ok()
+            {
+                let data: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();
+                let bytes = std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2);
+                let name = name.map(WStr::new);
+                let _ = RegSetValueExW(
+                    hkey,
+                    name.as_ref().map_or(windows::core::PCWSTR::null(), |n| n.p()),
+                    Some(0), REG_SZ, Some(bytes),
+                );
+                let _ = RegCloseKey(hkey);
+            }
+        };
+        set("", None, "Edit with Marq");
+        set("", Some("Icon"), &format!("\"{exe}\",0"));
+        set("command", None, &format!("\"{exe}\" --edit \"%1\""));
+    }
+}

@@ -25,7 +25,7 @@ const OK: u32 = argb(255, 0x34, 0xC7, 0x59);
 
 // Layout in 96-DPI units.
 const CW: i32 = 440;
-const CH: i32 = 318;
+const CH: i32 = 358;
 
 thread_local! {
     static CURRENT: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
@@ -39,6 +39,7 @@ enum Btn {
     Gallery,
     OpenFolder,
     Magnifier,
+    Explorer,
     Done,
 }
 
@@ -54,6 +55,7 @@ struct Settings {
     autostart: bool,
     gallery: bool,
     magnifier: bool,
+    explorer: bool,
     note: Option<(String, u32)>,
     hot: Option<Btn>,
 }
@@ -94,6 +96,7 @@ pub fn open() {
         autostart: settings::autostart_enabled(),
         gallery: settings::save_to_gallery(),
         magnifier: settings::magnifier(),
+        explorer: settings::explorer_menu(),
         note: None,
         hot: None,
     });
@@ -120,7 +123,7 @@ pub fn open() {
     }
 }
 
-fn buttons(dpi: u32) -> [(Btn, RECT); 7] {
+fn buttons(dpi: u32) -> [(Btn, RECT); 8] {
     let s = |v| sc(v, dpi);
     [
         (Btn::Change, rect(s(272), s(48), s(344), s(84))),
@@ -129,7 +132,8 @@ fn buttons(dpi: u32) -> [(Btn, RECT); 7] {
         (Btn::Gallery, rect(s(24), s(178), s(290), s(204))),
         (Btn::OpenFolder, rect(s(304), s(174), s(416), s(208))),
         (Btn::Magnifier, rect(s(24), s(226), s(290), s(252))),
-        (Btn::Done, rect(s(336), s(270), s(416), s(302))),
+        (Btn::Explorer, rect(s(24), s(266), s(290), s(292))),
+        (Btn::Done, rect(s(336), s(310), s(416), s(342))),
     ]
 }
 
@@ -208,7 +212,7 @@ fn paint(hwnd: HWND, st: &mut Settings) {
                 let (x, y, w, h) = (r.left as f32, r.top as f32, rect_w(r) as f32, rect_h(r) as f32);
                 let hot = st.hot == Some(*b);
                 match b {
-                    Btn::Autostart | Btn::Gallery | Btn::Magnifier => {
+                    Btn::Autostart | Btn::Gallery | Btn::Magnifier | Btn::Explorer => {
                         // Toggle switch.
                         let tw = f(40.0);
                         let th = f(22.0);
@@ -216,6 +220,7 @@ fn paint(hwnd: HWND, st: &mut Settings) {
                         let on = match b {
                             Btn::Gallery => st.gallery,
                             Btn::Magnifier => st.magnifier,
+                            Btn::Explorer => st.explorer,
                             _ => st.autostart,
                         };
                         let track = if on { ACCENT } else if hot { argb(255, 80, 80, 90) } else { argb(255, 64, 64, 72) };
@@ -265,10 +270,14 @@ fn paint(hwnd: HWND, st: &mut Settings) {
                     let lr = rect(r.left + s(52), r.top, r.right, r.bottom);
                     draw_text(back.dc, "Magnifier while selecting", lr, st.font, TEXT, DT_LEFT | single);
                 }
+                Btn::Explorer => {
+                    let lr = rect(r.left + s(52), r.top, r.right + s(120), r.bottom);
+                    draw_text(back.dc, "\u{201C}Edit with Marq\u{201D} in File Explorer", lr, st.font, TEXT, DT_LEFT | single);
+                }
             }
         }
         let ver = format!("Marq v{}", crate::updater::CURRENT);
-        draw_text(back.dc, &ver, rect(s(24), s(270), s(300), s(302)), st.font_s, MUTED, DT_LEFT | single);
+        draw_text(back.dc, &ver, rect(s(24), s(310), s(300), s(342)), st.font_s, MUTED, DT_LEFT | single);
         draw_text(
             back.dc, "Pictures \u{203A} Screenshots",
             rect(s(76), s(202), s(300), s(220)), st.font_s, MUTED, DT_LEFT | single,
@@ -339,6 +348,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 Some(Btn::Magnifier) => {
                     st.magnifier = !st.magnifier;
                     settings::set_magnifier(st.magnifier);
+                    redraw(hwnd);
+                }
+                Some(Btn::Explorer) => {
+                    st.explorer = !st.explorer;
+                    settings::set_explorer_menu(st.explorer);
                     redraw(hwnd);
                 }
                 Some(Btn::Done) => {
