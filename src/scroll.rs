@@ -163,21 +163,30 @@ pub fn start(r: RECT) {
     }
 }
 
+thread_local! {
+    /// Reused between ticks (same size every time) instead of a new bitmap per grab.
+    static GRAB_BUF: RefCell<Option<Dib>> = const { RefCell::new(None) };
+}
+
 fn grab(r: RECT) -> Option<Vec<u32>> {
     let (w, h) = (rect_w(&r), rect_h(&r));
-    let dib = Dib::new(w, h)?;
-    unsafe {
-        let screen = GetDC(None);
-        let _ = BitBlt(dib.dc, 0, 0, w, h, Some(screen), r.left, r.top, SRCCOPY);
-        ReleaseDC(None, screen);
-        let _ = GdiFlush();
-    }
-    let mut px = dib.pixels_mut().to_vec();
-    for p in px.iter_mut() {
-        *p |= 0xFF00_0000;
-    }
-    Some(px)
+    GRAB_BUF.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.as_ref().map_or(true, |d| d.w != w || d.h != h) {
+            *b = Some(Dib::new(w, h)?);
+        }
+        let dib = b.as_ref()?;
+        unsafe {
+            let screen = GetDC(None);
+            let _ = BitBlt(dib.dc, 0, 0, w, h, Some(screen), r.left, r.top, SRCCOPY);
+            ReleaseDC(None, screen);
+            let _ = GdiFlush();
+        }
+        Some(dib.pixels_mut().iter().map(|p| p | 0xFF00_0000).collect())
+    })
 }
+
+
 
 /// Scroll the page under the pointer down by `amount` (120 = one wheel notch).
 fn wheel(amount: i32) {
@@ -226,6 +235,7 @@ fn tick() {
 fn close() -> Option<Session> {
     let s = SESSION.with(|s| s.borrow_mut().take())?;
     crate::hotkey::clear_escape();
+    GRAB_BUF.with(|b| b.borrow_mut().take());
     unsafe {
         let _ = KillTimer(Some(s.bar), TIMER_TICK);
         let _ = DestroyWindow(s.bar);
@@ -251,6 +261,7 @@ pub fn finish() {
         return;
     }
     let img = Image { w: w as i32, h: rows as i32, px };
+    GRAB_BUF.with(|b| b.borrow_mut().take());
     crate::on_snip(img, near);
     trim_memory();
 }

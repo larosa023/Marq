@@ -61,7 +61,7 @@ pub struct Image {
     pub px: Vec<u32>,
 }
 
-/// Copy a rectangle out of a top-down pixel buffer.
+/// Copy a rectangle out of a top-down pixel buffer (alpha set to opaque).
 pub fn crop(px: &[u32], pw: i32, ph: i32, r: RECT) -> Image {
     let x0 = r.left.clamp(0, pw);
     let y0 = r.top.clamp(0, ph);
@@ -72,7 +72,7 @@ pub fn crop(px: &[u32], pw: i32, ph: i32, r: RECT) -> Image {
     let mut out = Vec::with_capacity((w * h) as usize);
     for y in y0..y1 {
         let row = (y * pw) as usize;
-        out.extend_from_slice(&px[row + x0 as usize..row + x1 as usize]);
+        out.extend(px[row + x0 as usize..row + x1 as usize].iter().map(|p| p | 0xFF00_0000));
     }
     Image { w, h, px: out }
 }
