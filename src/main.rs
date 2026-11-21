@@ -122,7 +122,6 @@ pub fn on_snip(img: Image, screen_rect: RECT) {
     toast::show(img, screen_rect, copied, saved);
 }
 
-/// Called by the overlay in Text mode: read the text in the area, copy it.
 /// Open a picture in the editor. Markup is copied to the clipboard as usual and saved
 /// next to the original as "<name> (Marq).png"; the original is never changed.
 fn edit_file(path: &str) {
@@ -147,6 +146,7 @@ pub fn on_color(color: u32, near: RECT) {
     toast::show_color(color, ok, near);
 }
 
+/// Called by the overlay in Text mode: read the text in the area, copy it.
 pub fn on_text(img: Image, screen_rect: RECT) {
     ocr::recognize_async(img, screen_rect, host(), WM_APP_OCR);
 }

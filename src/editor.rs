@@ -1062,6 +1062,8 @@ fn undo(hwnd: HWND, st: &mut Editor) {
         st.base = base;
         st.strokes = strokes;
         rebuild_committed(st);
+        st.mag = 1.0;
+        st.view = RECT::default();
         layout(hwnd, st);
         invalidate_all(hwnd);
         committed_changed(hwnd, st);
@@ -1083,6 +1085,8 @@ fn do_crop(hwnd: HWND, st: &mut Editor, s: &Stroke) {
     let old_strokes = std::mem::take(&mut st.strokes);
     st.crops.push((old_base, old_strokes));
     rebuild_committed(st);
+    st.mag = 1.0; // the picture changed size: show all of it
+    st.view = RECT::default();
     layout(hwnd, st);
     invalidate_all(hwnd);
     committed_changed(hwnd, st);
@@ -1414,13 +1418,18 @@ fn create_edit(hwnd: HWND, x: i32, y: i32, w: i32, h: i32, font: HFONT) -> Optio
 
 fn begin_text(hwnd: HWND, st: &mut Editor, x: i32, y: i32) {
     let at = clamp_to_image(st, to_image_space(st, x, y));
-    let px = sc(TEXT_PX[st.size], st.dpi);
+    // Shown at the size the text will have in the picture at the current zoom.
+    let px = ((sc(TEXT_PX[st.size], st.dpi) as f32 * st.scale / st.fit).round() as i32).clamp(6, 600);
     unsafe {
         let _ = DeleteObject(st.edit_font.into());
     }
     st.edit_font = font_px(px, 600);
     let h = px + sc(10, st.dpi);
-    let w = (st.view.right - x).max(sc(160, st.dpi));
+    let mut rc = RECT::default();
+    unsafe {
+        let _ = GetClientRect(hwnd, &mut rc);
+    }
+    let w = (st.view.right.min(rc.right) - x).max(sc(160, st.dpi));
     if let Some(edit) = create_edit(hwnd, x, y, w, h, st.edit_font) {
         st.entry = Some(TextEntry { edit, at, color: COLORS[st.color], purpose: Purpose::Label });
     }

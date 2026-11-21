@@ -26,9 +26,8 @@ pub fn capture_screen() -> Option<Frozen> {
         let _ = BitBlt(dib.dc, 0, 0, w, h, Some(screen), x, y, SRCCOPY); // no CAPTUREBLT: it makes the cursor flicker, and DWM already composes layered windows
         ReleaseDC(None, screen);
         let _ = GdiFlush();
-        for p in dib.pixels_mut().iter_mut() {
-            *p |= 0xFF00_0000;
-        }
+        // The alpha byte is left as the screen gave it: only the snipped part needs it
+        // set, and `crop` does that, instead of a pass over every monitor's pixels.
         Some(Frozen { dib, origin: (x, y) })
     }
 }

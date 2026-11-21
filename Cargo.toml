@@ -1,6 +1,6 @@
 [package]
 name = "marq"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 description = "Marq - a hyper-lightweight screen snipping tool for Windows"
 license = "MIT"
@@ -39,7 +39,7 @@ features = [
 embed-resource = "3"
 
 [profile.release]
-opt-level = "z"
+opt-level = 2 # pixel loops (dimming, stitching, blur) run ~2x faster than at "z" for little extra size
 lto = true
 codegen-units = 1
 panic = "abort"

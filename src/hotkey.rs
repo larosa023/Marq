@@ -37,6 +37,8 @@ static ESC_TARGET: AtomicIsize = AtomicIsize::new(0); // non-zero: Esc goes here
 static ESC_MESSAGE: AtomicU32 = AtomicU32::new(0);
 
 const LLKHF_INJECTED: u32 = 0x10;
+/// How often the hook is refreshed (see the hook thread).
+const REHOOK_MS: u32 = 5 * 60 * 1000;
 /// An unassigned virtual-key code. Tapping it tells Windows "another key was pressed",
 /// so letting go of Win doesn't open Start and letting go of Alt doesn't open menus.
 const VK_DUMMY: u16 = 0xFF;
@@ -82,13 +84,26 @@ pub fn install(notify: HWND, msg: u32) -> bool {
         if !ok {
             return;
         }
+        // Windows can drop a low-level hook without telling anyone (after sleep, or if
+        // the PC stalled long enough that a call timed out). Re-hooking now and then is
+        // cheap and means the shortcut can't silently stop working until a restart.
+        let mut hook = hook.ok();
+        let _ = SetTimer(None, 0, REHOOK_MS, None);
         // Low-level hooks are called through this thread's message loop.
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            if msg.message == WM_TIMER && msg.hwnd.is_invalid() {
+                if let Ok(fresh) = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_proc), Some(crate::util::hinstance()), 0) {
+                    if let Some(old) = hook.replace(fresh) {
+                        let _ = UnhookWindowsHookEx(old);
+                    }
+                }
+                continue;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-        if let Ok(h) = hook {
+        if let Some(h) = hook {
             let _ = UnhookWindowsHookEx(h);
         }
     });
